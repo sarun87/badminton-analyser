@@ -4,5 +4,5 @@ runs/
 yolo*.pt
 *.zip
 .DS_Store
-
+models
 
