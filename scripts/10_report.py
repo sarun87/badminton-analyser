@@ -35,7 +35,11 @@ def build_report(
     motion: dict[str, Any],
     pose: dict[str, Any],
     pickups: dict[str, Any],
+    shuttle: dict[str, Any] | None = None,
+    serving: dict[str, Any] | None = None,
 ) -> tuple[str, list[str]]:
+    shuttle = shuttle or {}
+    serving = serving or {}
     points = points_data.get("points", [])
     metrics_by_point = {int(point["n"]): point for point in motion.get("per_point", [])}
     pickup_by_point = {int(point["n"]): point for point in pickups.get("points", [])}
@@ -48,7 +52,7 @@ def build_report(
         "",
         f"Points reviewed: **{total}** · user won **{len(won)}** · user lost **{len(lost)}**",
         "",
-        "This report is generated locally from reviewed score and rally timestamps. Serve detection, rally ends, and pickup-side estimates need visual confirmation.",
+        "This report is generated locally from the score replay and rally intervals. Assisted score checks and automatic rally-end estimates still need visual confirmation.",
         "",
         "## Results by rally length",
         "",
@@ -110,6 +114,29 @@ def build_report(
             f"| {point['n']} | {'Won' if point['winner'] == 'R' else 'Lost'} | "
             f"{pickup.get('shuttle_side_estimate') or 'Unknown'} | {clue} |"
         )
+
+    tracklets = shuttle.get("tracklets", [])
+    server_suggestions = serving.get("suggestions", [])
+    lines.extend(["", "## Experimental shuttle and serve cues", ""])
+    if tracklets:
+        direction_changes = sum(len(track.get("possible_direction_changes", [])) for track in tracklets)
+        lines.append(
+            f"The local OpenCV tracker produced **{len(tracklets)} short shuttle-like paths** and "
+            f"**{direction_changes} possible direction changes**. These are image-based review cues; inspect the overlay and do not treat them as confirmed contacts or shot types."
+        )
+        lines.extend(["", "| Track | Visible interval | Image displacement | Possible direction changes |", "|---:|---:|---:|---:|"])
+        for track in tracklets[:30]:
+            turns = track.get("possible_direction_changes", [])
+            lines.append(
+                f"| {track.get('id', '?')} | {timestamp_label(float(track.get('start', 0)))}–{timestamp_label(float(track.get('end', 0)))} | "
+                f"{float(track.get('displacement_px', 0)):.0f} px | {len(turns)} |"
+            )
+    else:
+        lines.append("No shuttle tracklets were available. Run `scripts/04a_shuttle_track.py` to create experimental pixel paths.")
+    if server_suggestions:
+        high = sum(item.get("confidence") == "high" for item in server_suggestions)
+        lines.append(f"\nServe-player association: {high}/{len(server_suggestions)} candidates had high-confidence shuttle proximity suggestions; Stage 5 reviews uncertain cases.")
+    lines.append("The current tracker cannot identify clears, drops, smashes, racket contact, or stroke technique. Shuttle appearance and camera motion can create missed detections and false paths.")
 
     lost_examples = sorted(lost, key=lambda point: float(point.get("rdur", 0)), reverse=True)[:8]
     lines.extend(["", "## Lost-point review timestamps", ""])
@@ -175,7 +202,7 @@ def build_report(
             "",
             "## Data limits",
             "",
-            "Serve and player tracking are detector-based; visually review them. Rally end times were entered manually. Pose and pickup-side values are approximate and should be treated as prompts for video review, not definitive causes.",
+            "Serve and player tracking are detector-based; visually review them. Assisted rally-end estimates use shared player pauses and can mistake a mid-rally pause for a point end. Pose, pickup-side, and shuttle values are approximate review cues, not definitive causes or technique labels.",
             "",
         ]
     )
@@ -214,6 +241,8 @@ def main() -> int:
     parser.add_argument("--motion", help="Movement JSON; defaults to motion.json beside job.json.")
     parser.add_argument("--pose", help="Pose JSON; defaults to pose_stats.json beside job.json.")
     parser.add_argument("--pickups", help="Pickup JSON; defaults to pickups.json beside job.json.")
+    parser.add_argument("--shuttle", help="Optional shuttle JSON; defaults to shuttle_tracks.json beside job.json when present.")
+    parser.add_argument("--serving-analysis", help="Optional server-analysis JSON; defaults to serving_analysis.json beside job.json when present.")
     parser.add_argument("--output", help="Output Markdown; defaults to report.md beside job.json.")
     parser.add_argument("--ollama-model", help="Optional locally installed Ollama model, for example llama3.2:3b.")
     args = parser.parse_args()
@@ -224,12 +253,16 @@ def main() -> int:
         motion_path = Path(args.motion).expanduser().resolve() if args.motion else artifact_path(job_path, "motion.json")
         pose_path = Path(args.pose).expanduser().resolve() if args.pose else artifact_path(job_path, "pose_stats.json")
         pickups_path = Path(args.pickups).expanduser().resolve() if args.pickups else artifact_path(job_path, "pickups.json")
+        shuttle_path = Path(args.shuttle).expanduser().resolve() if args.shuttle else artifact_path(job_path, "shuttle_tracks.json")
+        serving_path = Path(args.serving_analysis).expanduser().resolve() if args.serving_analysis else artifact_path(job_path, "serving_analysis.json")
         output_path = Path(args.output).expanduser().resolve() if args.output else artifact_path(job_path, "report.md")
         report, recommendations = build_report(
             read_json(points_path),
             read_json(motion_path),
             read_json(pose_path),
             read_json(pickups_path),
+            read_json(shuttle_path) if shuttle_path.is_file() else None,
+            read_json(serving_path) if serving_path.is_file() else None,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(report, encoding="utf-8")

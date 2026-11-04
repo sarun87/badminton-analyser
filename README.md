@@ -11,8 +11,10 @@ From one phone video of a match:
 | Movement | Metres run, speed, how often each player is pulled out of position, court heatmaps |
 | Body position | Crouch, stance width, racket up or down while waiting for the opponent's shot |
 | Point-ending clues | Approximate pickup side after each point, for manual review |
+| Shuttle path cues | Experimental local pixel tracks and possible direction changes, shown in the overlay |
 | Coach summary | The 3 or 4 patterns that cost you the most points, with example timestamps |
-| Overlay video | Tracking overlays, pose skeleton, court mini map, scoreboard; coach voice-over remains unimplemented |
+| Overlay video | Player markers, camera-oriented court map, scorecard, a 30-second movement heatmap, and optional animated stats; skeleton and extra details are optional |
+| Coach voice-over | Optional offline macOS narration mixed into a narrated copy of the rendered video |
 
 
 ---
@@ -45,6 +47,8 @@ python scripts/08_pose.py --job "$MATCH_JOB"
 python scripts/09_pickups.py --job "$MATCH_JOB"
 python scripts/10_report.py --job "$MATCH_JOB"
 python scripts/11_render_video.py --job "$MATCH_JOB" --you-name "Your Name" --opponent-name "Opponent"
+# Optional local narration after rendering:
+# python scripts/12_voiceover.py --job "$MATCH_JOB"
 ```
 
 Stage 0 prompts for camera view and movement, confirms source resolution/FPS detected by `ffprobe`, and asks for a
@@ -61,15 +65,24 @@ the proxy always uses the standard dimensions and frame rate above.
 | 2. Calibrate court | `scripts/02_calibrate.py` | `calibration.json` and `calibration_previews/`; click the four court corners and inspect every projected court overlay. |
 | 3. Track players | `scripts/03_track.py` | `players.json` and `review/tracking/`; select yourself in a reference frame, then inspect annotated tracking samples. |
 | 4. Find serve pauses | `scripts/04_serve_candidates.py` | `serve_candidates.json`; automated candidate periods only. |
-| 5. Review serves and score | `scripts/05_score.py` | `score.json` and `review/serves/`; confirm or discard candidates, add missed serves, select server/service court, mark game starts, and confirm the final point winner. |
-| 6. Review rally ends | `scripts/06_rallies.py` | `points.json` and `review/rallies/`; inspect each contact sheet and enter the last live-play timestamp. |
+| 4a. Track shuttle (optional) | `scripts/04a_shuttle_track.py` | `shuttle_tracks.json`; experimental local image-motion tracks and possible direction-change cues. |
+| 4b. Associate serve player (optional) | `scripts/04b_serve_analysis.py` | `serving_analysis.json`; matches early shuttle detections to tracked player boxes. |
+| 5. Review serves and score | `scripts/05_score.py` | Manual mode reviews each candidate. Assisted mode uses the first-server answer, shuttle-based server suggestions, and start/final scores; it checks candidate count and asks about uncertain servers. |
+| 6. Review rally ends | `scripts/06_rallies.py` | Manual mode reviews each contact sheet. Assisted mode estimates clear shared-player pauses and manually reviews uncertain points. |
 | 7. Measure movement | `scripts/07_movement.py` | `motion.json` and `heatmaps/`; distance, speed, court share, recovery trips, and heatmaps. |
 | 8. Estimate body position | `scripts/08_pose.py` | `pose_stats.json`; approximate pose measures grouped by outcome and court context. |
 | 9. Estimate pickup side | `scripts/09_pickups.py` | `pickups.json`; low-confidence bend-based shuttle-side clues. |
 | 10. Build report | `scripts/10_report.py` | `report.md`; local statistics and timestamp-linked review suggestions. Optional `--ollama-model` writes `coach_draft.md` through a local Ollama server. |
-| 11. Render overlay video | `scripts/11_render_video.py` | `overlay.mp4`; foot rings, trails, user skeleton, top-down court map, point number, server, winner, and running score. Pass `--you-name` and `--opponent-name` for scoreboard labels. |
+| 11. Render overlay video | `scripts/11_render_video.py` | `overlay.mp4`; enlarged player rings, camera-oriented court map, two-row scorecard, and a 30-second movement heatmap ending. `--show-skeleton`, `--show-details`, `--show-shuttle`, and `--show-stats` opt into extra overlays/outros. |
+| 12. Coach voice-over (optional) | `scripts/12_voiceover.py` | `coach_narration.txt`, `coach_voiceover.aiff`, and `overlay_with_voiceover.mp4`; offline macOS text-to-speech from score/movement results and a report coaching note. |
 
-Stages 1–11 accept `--job` and optional `--output` or input-artifact path arguments; Stage 0 accepts `--input` and `--output-dir`. Run `python scripts/NN_name.py --help` for a stage's options. Stages 2, 3, 5, and 6 require interactive review.
+Stages 1–12 and optional scripts 04a/04b accept `--job` and optional `--output` or input-artifact path arguments; Stage 0 accepts `--input` and `--output-dir`. Run `python scripts/NN_name.py --help` for a script's options. Stages 2, 3, 5, and 6 can require interactive review.
+
+The default review mode remains manual. For the optional reduced-review path, run Stage 4a, then 4b, and choose `--review-mode assisted` for Stages 5 and 6. Assisted scoring is for a single game per video. If the clip starts mid-game, enter its score before the first recorded point and the final score visible in the clip. For example, 10-10 to 21-18 implies 19 recorded points. A candidate-count mismatch stops assisted scoring and directs you to manual review. Equal counts are only a consistency check; a missed serve and a false candidate can cancel each other out.
+
+For optional animated graphs in the rendered outro, pass `--show-stats` to Stage 11. It adds two explained charts after the heatmap: point outcomes by rally length, and your average tracked movement on won vs lost points. This requires `motion.json` from Stage 7. The default render does not include the graph outro.
+
+For optional narration, run `python scripts/12_voiceover.py --job "$MATCH_JOB"` after Stage 11. It uses macOS's built-in `say` command locally, adds the spoken summary over the heatmap ending or stats outro, and writes `overlay_with_voiceover.mp4`. Use `--voice Alex` or `--rate 160` to select a system voice or change the speaking rate. No cloud service or paid model is used.
 
 For an optional local AI draft, install Ollama and a small free model. Start `ollama serve` in a separate terminal,
 then run `ollama pull llama3.2:3b` and `python scripts/10_report.py --job "$MATCH_JOB" --ollama-model llama3.2:3b`.
@@ -99,11 +112,14 @@ phone video (4K / 1080p)
    |
    +--> [4] SERVES     stationary windows in opposite service areas                                  -> serve_candidates.json
    |         |
+   |         +--> [4a] SHUTTLE (optional) experimental bright-motion tracklets                       -> shuttle_tracks.json
+   |         |          |
+   |         |          +--> [4b] SERVER (optional) associate tracklets with player boxes            -> serving_analysis.json
    |         v
-   |    [5] SCORE      visual serve review + singles score replay                                    -> score.json
+   |    [5] SCORE      manual review or assisted single-game score replay                            -> score.json
    |         |
    |         v
-   |    [6] RALLIES    manually reviewed rally ends from contact sheets                               -> points.json
+   |    [6] RALLIES    manual review or confidence-gated shared-pause estimate                       -> points.json
    |
    +--> [7] MOVEMENT   distance, speed, front/back court share, trips out of position, heatmaps        -> motion.json
    |
@@ -115,7 +131,10 @@ phone video (4K / 1080p)
 [10] REPORT      local metrics and evidence-linked coaching notes                                    -> report.md
    |
    v
-[11] VIDEO       tracking overlays + pose skeleton + mini map + score panel                  -> overlay.mp4
+[11] VIDEO       player markers + camera-oriented mini map + scorecard                         -> overlay.mp4 + 30s heatmap ending
+                  optional skeleton, extra detail panel, shuttle marks, animated stats outro
+   |
+   +--> [12] VOICEOVER  macOS built-in speech synthesis; narrated video copy                  -> overlay_with_voiceover.mp4
 ```
 
 ### Court coordinate system (used everywhere)
@@ -183,25 +202,34 @@ The first run downloads the model weights; inference uses Apple Silicon MPS when
 - Smooth positions over 0.5 s (box jitter), then compute speed.
 - A candidate requires both players in opposite singles service areas, within the court's x margins, moving slowly
   for at least 0.8 s. This stage does not infer who served; the next stage visually confirms that.
-- Stage 5 records the server and service court from contact sheets. The server's score must be even in his right
-  service court and odd in his left; contradictions are flagged in `score.json`.
+- The default manual Stage 5 review records server and service court from contact sheets.
+
+### [4a] Experimental shuttle tracking (optional)
+
+- `scripts/04a_shuttle_track.py` uses OpenCV bright-motion regions to create short pixel-space tracklets without a shuttle-specific model or network service.
+- Lines, lights, compression, and motion blur can produce false or missing tracks. The output can add visual path and direction-change cues to the overlay, but it is not a calibrated 3D trajectory.
+- It does not classify clears, drops, smashes, racket contact, or stroke technique. Use it as a visual aid and inspect the overlay.
+
+### [4b] Serve-player association (optional)
+
+- `scripts/04b_serve_analysis.py` checks early shuttle-like detections against the two tracked player boxes and writes a server suggestion for each Stage 4 candidate.
+- Stage 5 uses only high-confidence suggestions automatically. It asks you to review suggestions without enough shuttle evidence. These are heuristics, not a trained serve recognizer.
 
 ### [5] Score replay
 
 - Singles rule: the **winner of a rally serves the next one**. So the server of serve N+1 is the winner of point N.
-- The side rule is a consistency check: the server must stand in the right court when his score is even. Enter the
-  initial score if the video starts mid-game and mark every game reset.
-- **Check every serve by eye:** Stage 5 writes a contact sheet for each candidate, lets you discard false candidates,
-  and lets you add missed serves manually. The winner of point N is inferred from the server of point N+1; the last
-  point's winner is entered manually. Mark the first serve after each game break so the score and side parity reset.
+- The default `--review-mode manual` keeps the current contact-sheet workflow, including candidate discard/add, court-side entry, and game breaks.
+- Optional `--review-mode assisted` assumes one game per video. Enter the score before the first recorded point, final score, and first server. The point total is `final score total - starting score total`; for 10-10 to 21-18 this is 19 points.
+- Assisted mode stops if the serve-candidate count differs from that point total. It uses high-confidence server suggestions, reviews uncertain serves, infers each earlier point winner from the next server, and checks the replay against the final score. Service court is calculated from the server's score parity.
+- A matching candidate count cannot prove every serve is correct: one false candidate can mask one missed serve. Recheck manually if a score replay fails or the video has long breaks/game resets.
 
 ### [6] Rally ends
 
 - **Do not use racket sounds in a hall with more than one court.** My first version did, and other courts' hits made
   rallies look twice as long (wrong by more than 1 s on 52 of 64 points).
-- Stage 6 writes a contact sheet per point (one frame every 0.5 s from serve to next serve) and asks you to enter
-  the last live-play timestamp before the pause. The timing is manual and should be checked against the video.
-- Automating this properly needs shuttle tracking (for example TrackNet-style models). I did not use one here.
+- The default manual mode writes a contact sheet per point (one frame every 0.5 s) and asks for the last live-play timestamp.
+- Assisted mode estimates a boundary when both tracked players remain nearly still after live play, and sends uncertain points through the same manual review. A long pause can also happen during a rally, so check automatic intervals before relying on rally-length statistics.
+- The optional shuttle tracker is experimental and is not reliable enough to replace rally-end review or identify stroke technique.
 
 ```json
 {"n": 21, "t": 236.1, "next_t": 247.0, "server": "R", "side": "right", "before": "8-12", "winner": "O",
@@ -260,11 +288,11 @@ across from his own left sideline, so both players compare directly):
 
 ### [11] The video (optional)
 
-Stage 11 renders `overlay.mp4` at the proxy's frame rate and resolution, with source audio when present. It draws
-foot rings and trails for both players, the user's pose skeleton from Stage 8, a top-down court map, and a scoreboard
-with the point, server, winner, names, and running score. Supply display names with `--you-name` and
-`--opponent-name`. Run Stage 8 first for the skeleton overlay; tracking, map, and score overlays can render without
-pose samples.
+Stage 11 renders `overlay.mp4` at the proxy's frame rate and resolution, with source audio during the match footage. The default has enlarged foot rings and player trails, a camera-oriented court map, a two-row scorecard with uppercase names, and an appended 30-second movement timelapse with an accumulating heatmap. The default boxes are the scorecard and court map; skeleton, the extra details box, shuttle marks, and stats graphs are off. Use `--show-skeleton` to include Stage 8 pose samples, `--show-details` to add a box under the scorecard with game/point/server/status/time, `--show-shuttle` to draw experimental shuttle paths, and `--show-stats` to add two animated, explained charts after the heatmap. Stats need `motion.json` from Stage 7. Use `--no-heatmap-clip` to omit the ending or `--heatmap-seconds 45` to change its duration. The near side of the court map is at the bottom, matching the behind-baseline camera view.
+
+### [12] Coach voice-over (optional)
+
+Run `scripts/12_voiceover.py --job "$MATCH_JOB"` after Stage 11. It reads the reviewed score and movement summary, optionally includes the first coaching note from `report.md`, and uses the built-in macOS `say` voice to create narration locally. It writes an audio file, the narration text, and `overlay_with_voiceover.mp4`. Narration starts over the heatmap ending, or over the stats graphs when Stage 11 was run with `--show-stats`. If speech runs longer than the video, the final frame is held until the narration finishes.
 
 ---
 
