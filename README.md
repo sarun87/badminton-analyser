@@ -1,307 +1,128 @@
-For the full command-by-command setup and interactive review walkthrough, see [HOW_TO_RUN.md](HOW_TO_RUN.md).
+# Badminton Match Analysis
 
-## What you get at the end
+A local Python pipeline that turns one singles-match video into a reviewed score log, rally and movement metrics, pose summaries, coaching notes, and an optional narrated video. It runs locally without an NVIDIA GPU. Stage 1 can use Apple Core ML with CPU-and-GPU compute on supported Apple Silicon systems. Stages 0 and 11 use FFmpeg's VideoToolbox H.264 encoder on macOS when available. Stage 10A can use Ollama on the same computer or create a prompt file for a chat model.
 
-From one phone video of a match:
+## Filming requirements
 
-| Output | What it tells you |
-|---|---|
-| Point-by-point score | Who served, from which side, who won each point, the running score |
-| Rally lengths | How long every point lasted, and who wins short vs long rallies |
-| Movement | Metres run, speed, how often each player is pulled out of position, court heatmaps |
-| Body position | Crouch, stance width, racket up or down while waiting for the opponent's shot |
-| Point-ending clues | Approximate pickup side after each point, for manual review |
-| Shuttle path cues | Experimental local pixel tracks and possible direction changes, shown in the overlay |
-| Coach summary | The 3 or 4 patterns that cost you the most points, with example timestamps |
-| Overlay video | Player markers, camera-oriented court map, scorecard, a 30-second movement heatmap, and optional animated stats; skeleton and extra details are optional |
-| Coach voice-over | Optional offline macOS narration mixed into a narrated copy of the rendered video |
+- Place a steady camera behind one baseline, raised enough to see both players. Keep all visible court lines in frame, including the net, sidelines, baselines, and service lines.
+- Keep the camera fixed. A moved camera needs a separate calibration for that position and time range.
+- Record at normal speed with steady lighting. 1080p or 4K at 30 fps works well; Stage 0 makes a 720p proxy.
+- Wear clothing that distinguishes the player you want analyzed. Stage 3 asks for a shirt or pants color, assigns that person as R wherever they are on court, and assigns the opponent as O.
+- Keep spectators and adjacent courts out of the court area where possible. The detector can find them, so tracking still needs review.
 
+The current tracking and score workflow assumes **singles** and a camera behind a baseline. Side-on footage and doubles need different tracking and calibration logic.
 
----
+## Install on macOS
 
-## Run the Singles Pipeline (macOS)
-
-This pipeline supports Intel and Apple Silicon Macs. Install Homebrew first if it is not already installed, then run the initializer; it detects the Mac architecture, selects native Homebrew, and installs FFmpeg, Python 3.12, and the local Python packages:
+Install [Homebrew](https://brew.sh/) first if it is not already available. Then install Python and FFmpeg (which provides both `ffmpeg` and `ffprobe`):
 
 ```sh
-bash scripts/init_macos.sh
+brew install python@3.11 ffmpeg
+```
+
+Python 3.11 is the recommended setup; the scripts use Python 3.10 or newer syntax.
+
+From the repository directory, create a virtual environment and install the runtime packages:
+
+```sh
+python3.11 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-The first run of detection or pose analysis downloads the free Ultralytics model weights. Video processing and all
-analysis run locally; no hosted API is used. Apple Silicon uses MPS for inference when available; Intel Macs use CPU.
+`requirements.txt` contains the packages used by the current scripts: MediaPipe, NumPy, ONNX Runtime, and OpenCV with its GUI modules. OpenCV's GUI is needed for Stage 2 calibration and Stage 3's identity review window. Use one OpenCV wheel only; do not add `opencv-python` alongside `opencv-contrib-python`. On Apple Silicon, Stage 1 automatically selects ONNX Runtime's Core ML provider when the installed build exposes it; otherwise it runs on CPU. Core ML is configured for CPU-and-GPU compute, with the CPU provider available for unsupported operations.
 
-Create a new job for each video, then pass its `job.json` to every later stage:
+Stages 0 and 11 check FFmpeg's encoder list and automatically select `h264_videotoolbox` on macOS when available; otherwise they use `libx264`. VideoToolbox accelerates H.264 encoding. Stage 0 scaling/HDR tone mapping and Stage 11 frame overlays still run through their existing CPU paths. Use `--video-encoder libx264` to force software encoding or `--video-encoder h264_videotoolbox` to require VideoToolbox. VideoToolbox uses a target bitrate (`2500k` for Stage 0, `4M` for Stage 11 by default), while the `libx264` path keeps its CRF quality setting. Both stages accept `--videotoolbox-bitrate` to adjust the hardware encoder bitrate.
+
+Check the installation:
 
 ```sh
-python scripts/00_proxy.py --input "/path/to/match.mov" --output-dir "runs/match-01"
-MATCH_JOB="runs/match-01/job.json"
-python scripts/01_detect.py --job "$MATCH_JOB"
-python scripts/02_calibrate.py --job "$MATCH_JOB"
-python scripts/03_track.py --job "$MATCH_JOB"
-python scripts/04_serve_candidates.py --job "$MATCH_JOB"
-python scripts/05_score.py --job "$MATCH_JOB"
-python scripts/06_rallies.py --job "$MATCH_JOB"
-python scripts/07_movement.py --job "$MATCH_JOB"
-python scripts/08_pose.py --job "$MATCH_JOB"
-python scripts/09_pickups.py --job "$MATCH_JOB"
-python scripts/10_report.py --job "$MATCH_JOB"
-python scripts/11_render_video.py --job "$MATCH_JOB" --you-name "Your Name" --opponent-name "Opponent"
-# Optional local narration after rendering:
-# python scripts/12_voiceover.py --job "$MATCH_JOB"
+ffmpeg -version
+ffprobe -version
+python -c 'import cv2, mediapipe, numpy, onnxruntime; print("Python packages are ready")'
 ```
 
-Stage 0 prompts for camera view and movement, confirms source resolution/FPS detected by `ffprobe`, and asks for a
-description of your clothing. This pipeline currently analyzes singles only. It writes `proxy.mp4` and `job.json` in
-the output directory. The proxy is H.264, 1280x720, 30 FPS, BT.709 SDR; it keeps the source aspect ratio with padding
-and retains audio when present. HDR transfer tags trigger tone mapping. Source resolution/FPS are recorded as metadata;
-the proxy always uses the standard dimensions and frame rate above.
+### Model files
 
-### Stage outputs and review steps
+Stage 1 needs a YOLOX-S model exported to ONNX. The model is not versioned in the repository. Get the pretrained COCO model and export instructions from the [official YOLOX project](https://github.com/Megvii-BaseDetection/YOLOX). Stage 1 expects a 640×640 YOLOX-S model with the raw head output (do not enable `decode_in_inference` in the exporter); the COCO `person` class must be class 0. Save it as `models/yolox_s.onnx`; `models/` is ignored by Git so the large weights stay local. The package script includes that file if it is present. YOLOX is Apache-2.0 licensed.
 
-| Stage | Script | Output and required review |
+Stages 8 and 11 need Google's official MediaPipe Pose Landmarker heavy model. If it is not already bundled under `models/`, download it there:
+
+```sh
+mkdir -p models
+curl -fL \
+  https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_heavy/float16/1/pose_landmarker_heavy.task \
+  -o models/pose_landmarker_heavy.task
+```
+
+The archive script includes `models/*.onnx` and `models/*.task` when present, but never includes match runs.
+
+Stage 11 uses macOS `say` for optional local narration. If the default voice is unavailable, list installed voices with `say -v '?'`, choose one with `--voice`, or pass `--no-voice`. Stage 11 also needs FFmpeg. For AI coaching, Ollama is optional: install the [Ollama macOS app](https://ollama.com/download/mac), then use the local setup described below.
+
+## Start a new match
+
+Create a separate working directory for each match under `runs/`, such as `runs/match-1/`. Put the original video there, or refer to an input video elsewhere while directing all outputs into the run directory. The repository's `.gitignore` excludes run contents, model weights, `.venv`, and Python caches; scripts and documentation remain versionable.
+
+Stage 0 requires the timestamp in the **original video** when the first serve at 0–0 begins. Use `0` if the match starts immediately:
+
+```sh
+mkdir -p runs/match-1
+.venv/bin/python scripts/stage0_proxy.py \
+  runs/match-1/match.mp4 \
+  runs/match-1/match-720p.mp4 \
+  --match-start-sec 123.4
+```
+
+Put the source video at `runs/match-1/match.mp4` or change the input path. Replace `123.4` with the first-serve timestamp. Stage 0 writes a 1280×720, 30 fps SDR video and a `.proxy.json` sidecar in the run directory. All later timestamps start at zero in the proxy; add `first_serve_at_0_0_source_sec` from the sidecar to map a timestamp back to the original video. Stage 0 tone-maps common HDR transfers. It stops if the source color transfer is missing or unrecognized; inspect that video before converting it manually.
+
+The scripts and their argument order are listed below. Complete copy-ready examples are in [command_pipeline.md](command_pipeline.md); set `RUN_DIR` to a new folder for each match and update the sample video filename.
+
+## Pipeline and review checkpoints
+
+| Stage | What it produces | Review before continuing |
 |---|---|---|
-| 1. Detect people | `scripts/01_detect.py` | `detections.json`; person boxes sampled at about 10 FPS. |
-| 2. Calibrate court | `scripts/02_calibrate.py` | `calibration.json` and `calibration_previews/`; click the four court corners and inspect every projected court overlay. |
-| 3. Track players | `scripts/03_track.py` | `players.json` and `review/tracking/`; select yourself in a reference frame, then inspect annotated tracking samples. |
-| 4. Find serve pauses | `scripts/04_serve_candidates.py` | `serve_candidates.json`; automated candidate periods only. |
-| 4a. Track shuttle (optional) | `scripts/04a_shuttle_track.py` | `shuttle_tracks.json`; experimental local image-motion tracks and possible direction-change cues. |
-| 4b. Associate serve player (optional) | `scripts/04b_serve_analysis.py` | `serving_analysis.json`; matches early shuttle detections to tracked player boxes. |
-| 5. Review serves and score | `scripts/05_score.py` | Manual mode reviews each candidate. Assisted mode uses the first-server answer, shuttle-based server suggestions, and start/final scores; it checks candidate count and asks about uncertain servers. |
-| 6. Review rally ends | `scripts/06_rallies.py` | Manual mode reviews each contact sheet. Assisted mode estimates clear shared-player pauses and manually reviews uncertain points. |
-| 7. Measure movement | `scripts/07_movement.py` | `motion.json` and `heatmaps/`; distance, speed, court share, recovery trips, and heatmaps. |
-| 8. Estimate body position | `scripts/08_pose.py` | `pose_stats.json`; approximate pose measures grouped by outcome and court context. |
-| 9. Estimate pickup side | `scripts/09_pickups.py` | `pickups.json`; low-confidence bend-based shuttle-side clues. |
-| 10. Build report | `scripts/10_report.py` | `report.md`; local statistics and timestamp-linked review suggestions. Optional `--ollama-model` writes `coach_draft.md` through a local Ollama server. |
-| 11. Render overlay video | `scripts/11_render_video.py` | `overlay.mp4`; enlarged player rings, camera-oriented court map, two-row scorecard, and a 30-second movement heatmap ending. `--show-skeleton`, `--show-details`, `--show-shuttle`, and `--show-stats` opt into extra overlays/outros. |
-| 12. Coach voice-over (optional) | `scripts/12_voiceover.py` | `coach_narration.txt`, `coach_voiceover.aiff`, and `overlay_with_voiceover.mp4`; offline macOS text-to-speech from score/movement results and a report coaching note. |
+| 0 — Proxy | Trimmed 720p video and timestamp sidecar | Uses VideoToolbox H.264 encoding on macOS when available. Add `--quiet-ffmpeg` to hide FFmpeg warnings and progress while keeping errors visible. Check that the proxy begins at the first 0–0 serve, has both players and the whole court visible, and plays correctly. |
+| 1 — Detection | `dets.json` and a detection contact sheet | Uses Core ML CPU-and-GPU compute when available, otherwise CPU. Check that player boxes are reasonable; adjacent-court players may also be detected. |
+| 2 — Calibration | Court homography JSON and overlay image | Manually click at least four known court points. Confirm overlay lines sit on the actual lines; redo it for every camera position. |
+| 3 — Tracking | `players.json` and a tracking contact sheet | Choose shirt/pants and its color to identify R. Review the opened image and confirm or swap the R/O assignment before continuing. R may be on either court half. |
+| 4 — Serves | `serves.json`, `manual_score_review.json`, review sheets, and optional racket-orientation template | Review candidates, server, and court side. Stage 4 creates a score-review draft with one row per accepted candidate; its server/side and score guesses need review. |
+| 5 — Score | `points.json` | Correct every row in Stage 4's `manual_score_review.json`, add any missed video serves or score-only dummy points, and enter the final result. Stage 5 requires every accepted Stage 4 candidate exactly once. |
+| 6 — Rally ends | `rallies_review.json` and picture-only contact sheets | The optional `--estimate-rally-ends players.json` option finds the first sustained pause after active movement. Check estimated starts and ends against the frames and correct bad estimates. Do not use hall audio to mark rallies. |
+| 7 — Movement | `motion.json` and heatmap images | Runs from the Stage 3 tracks and Stage 6 times. Check for plausible distances and speeds; incorrect rally windows affect these values. |
+| 8 — Pose | `pose_stats.json` and `pose_review.jpg` | Confirm the skeleton follows R, as selected in Stage 3, and landmarks align with the body. Measurements are estimates, not proof of why a point was won or lost. |
+| 9 — Pickups | `pickups.json` and `pickup_review.jpg` | Inspect candidate bends. For a clear correction, set that point's `landing_side` to `R` (analyzed player side), `O` (opponent side), or `null` (unknown), and set `status` to `manual_confirmed`. Pickup side is indirect evidence. |
+| 10 — Report | `report_data.json` and `coach_report.md` | Enter the two player names. Review the selected losses, contact-sheet citations, and estimated patterns before treating them as coaching conclusions. |
+| 10A — AI coach (optional) | `AI-coach-context.md` and optionally `AI-coach-narrative.md` | Use Ollama locally or paste the context into a chat model and save its response. This stage is optional; no chat agent is required to run the rest of the pipeline. |
+| 11 — Video (optional) | Annotated full-match or short-analysis MP4 | Uses VideoToolbox H.264 encoding on macOS when available. Review the score box, server marker, tracking, court map, commentary, and audio. On the map, the camera-side near court should be below the net and the far court above it; R may appear on either half. Use `--short-mode` to omit the full-match portion, `--no-voice` to omit narration, or `--no-pose` to omit pose inference. |
 
-Stages 1–12 and optional scripts 04a/04b accept `--job` and optional `--output` or input-artifact path arguments; Stage 0 accepts `--input` and `--output-dir`. Run `python scripts/NN_name.py --help` for a script's options. Stages 2, 3, 5, and 6 can require interactive review.
+The manual work is concentrated in selecting the Stage 0 start time, clicking and checking Stage 2 calibration, verifying Stage 5's score, and correcting visibly wrong Stage 6 estimates. Other stages run automatically but still need the checks above. You do not need to use an assistant or cloud service to run the pipeline.
 
-The default review mode remains manual. For the optional reduced-review path, run Stage 4a, then 4b, and choose `--review-mode assisted` for Stages 5 and 6. Assisted scoring is for a single game per video. If the clip starts mid-game, enter its score before the first recorded point and the final score visible in the clip. For example, 10-10 to 21-18 implies 19 recorded points. A candidate-count mismatch stops assisted scoring and directs you to manual review. Equal counts are only a consistency check; a missed serve and a false candidate can cancel each other out.
+## AI coaching and privacy
 
-For optional animated graphs in the rendered outro, pass `--show-stats` to Stage 11. It adds two explained charts after the heatmap: point outcomes by rally length, and your average tracked movement on won vs lost points. This requires `motion.json` from Stage 7. The default render does not include the graph outro.
+Stage 10 is deterministic: it summarizes the local JSON measurements and writes timestamped review notes. It does not call an LLM. Stage 10A can create a self-contained `AI-coach-context.md` file for a user-selected chat agent, or send the evidence to Ollama at `localhost`. Ollama mode is local; it does not send match data to a hosted endpoint. The context-file workflow only shares data if you choose to paste it elsewhere. Stage 11 uses `AI-coach-narrative.md` when present and otherwise uses Stage 10's notes.
 
-For optional narration, run `python scripts/12_voiceover.py --job "$MATCH_JOB"` after Stage 11. It uses macOS's built-in `say` command locally, adds the spoken summary over the heatmap ending or stats outro, and writes `overlay_with_voiceover.mp4`. Use `--voice Alex` or `--rate 160` to select a system voice or change the speaking rate. No cloud service or paid model is used.
+For local Ollama coaching, install and start Ollama, then download a model once:
 
-For an optional local AI draft, install Ollama and a small free model. Start `ollama serve` in a separate terminal,
-then run `ollama pull llama3.2:3b` and `python scripts/10_report.py --job "$MATCH_JOB" --ollama-model llama3.2:3b`.
-This writes `coach_draft.md` by calling Ollama on `127.0.0.1`; the default report works without Ollama.
-
-The court calibration works with a baseline or side view when all four court corners are visible. For a moving camera,
-Stage 2 asks for stable time intervals; uncalibrated gaps are skipped. A continuously moving camera requires enough
-stable intervals to cover the useful footage. Singles tracking assumes one player on each side of the net.
-
----
-
-## Architecture
-
-```
-phone video (4K / 1080p)
-   |
-   v
-[0] PROXY        ffmpeg -> 1280x720, 30 fps, SDR (HDR iPhone video must be tone-mapped)
-   |
-   v
-[1] DETECT       YOLO person boxes every 3rd frame (10 fps)                 -> detections.json
-   |
-[2] CALIBRATE    4+ court points clicked once per camera position -> homography H (court metres <-> pixels)
-   |
-   v
-[3] PLAYERS      clothing appearance match + opponent, feet -> court metres, gap fill, despike         -> players.json
-   |
-   +--> [4] SERVES     stationary windows in opposite service areas                                  -> serve_candidates.json
-   |         |
-   |         +--> [4a] SHUTTLE (optional) experimental bright-motion tracklets                       -> shuttle_tracks.json
-   |         |          |
-   |         |          +--> [4b] SERVER (optional) associate tracklets with player boxes            -> serving_analysis.json
-   |         v
-   |    [5] SCORE      manual review or assisted single-game score replay                            -> score.json
-   |         |
-   |         v
-   |    [6] RALLIES    manual review or confidence-gated shared-pause estimate                       -> points.json
-   |
-   +--> [7] MOVEMENT   distance, speed, front/back court share, trips out of position, heatmaps        -> motion.json
-   |
-   +--> [8] POSE       body landmarks on a crop around the identified user                            -> pose_stats.json
-   |
-   +--> [9] PICKUPS    who bends to pick up the shuttle after the rally -> which side it landed         -> pickups.json
-   |
-   v
-[10] REPORT      local metrics and evidence-linked coaching notes                                    -> report.md
-   |
-   v
-[11] VIDEO       player markers + camera-oriented mini map + scorecard                         -> overlay.mp4 + 30s heatmap ending
-                  optional skeleton, extra detail panel, shuttle marks, animated stats outro
-   |
-   +--> [12] VOICEOVER  macOS built-in speech synthesis; narrated video copy                  -> overlay_with_voiceover.mp4
+```sh
+ollama pull qwen2.5:7b
+.venv/bin/python scripts/stage10a_ai_coach.py runs/match-1/report_data.json --mode ollama --model qwen2.5:7b
 ```
 
-### Court coordinate system (used everywhere)
+To create a context file instead:
 
-Metres, oriented as if standing at the chosen near baseline and facing the far baseline. For a side view, choose one
-baseline as near and keep that orientation for every calibration segment:
-
-- `x` across the court: `0` = the left doubles sideline (camera view), `6.1` = the right doubles sideline.
-- `y` along the court: `0` = near baseline, `6.7` = net, `13.4` = far baseline.
-- Useful lines: centre line `x = 3.05`, singles sidelines `x = 0.46` and `x = 5.64`, near short service line
-  `y = 4.72` (1.98 m from the net), far short service line `y = 8.68`, doubles long service lines 0.76 m inside each
-  baseline.
-
----
-
-## The stages in detail
-
-### [0] Working copy
-
-Convert the match to a 1280x720, 30 fps SDR file once. Everything below reads this copy. iPhone videos are often HDR
-(HLG): Stage 0 tone-maps tagged HDR video to SDR so clothing colors remain useful for appearance matching.
-
-### [1] Person detection
-
-- Run the free Ultralytics YOLO11n person detector on every 3rd proxy frame (10 fps), confidence 0.3, NMS IoU 0.5.
-- Store boxes as fractions of the frame so resolution does not matter:
-
-```json
-{"fps": 10.0, "frames": [{"t": 12.3, "p": [[x1, y1, x2, y2, score], ...]}, ...]}
+```sh
+.venv/bin/python scripts/stage10a_ai_coach.py runs/match-1/report_data.json
 ```
 
-The first run downloads the model weights; inference uses Apple Silicon MPS when available and CPU on Intel Macs.
+When a stage offers `--overwrite`, use it to replace existing outputs. Stage 10 rewrites its two report files. Re-run downstream stages after changing an upstream review file so scores, rally metrics, and coaching outputs stay consistent. Do not reuse a score-review JSON from a different match without replacing its match-specific serve rows.
 
-### [2] Court calibration (homography)
+## Package the application
 
-- Take one clear frame per stable camera position and click the four baseline/sideline court corners in the order
-  shown by the calibration UI. All four corners must be visible; side views work when they show the full court.
-- `H = cv2.findHomography(court_points_metres, pixel_points)`. Map pixels to the court with `inv(H)`.
-- **Check it:** draw the whole court from `H` back onto the frame. Every line must sit on the real line. If not,
-  re-click. Everything downstream depends on this.
-- If the camera moved, enter each stable time range. The tool stores one `H` per range and leaves movement gaps
-  uncalibrated so downstream stages skip them.
+Create a ZIP archive for another Mac with:
 
-### [3] Player identification and tracking
-
-- Select yourself in a clear reference frame and choose whether the identifying clothing is your shirt or shorts.
-  The tracker compares a color histogram for that clothing region across detections.
-- A player's position is the **bottom centre of the box** (the feet), mapped to court metres with the segment's
-  homography. The appearance-matched player is `r`; the remaining player in the opposite half is `o`.
-- **Filter out** boxes taller than 55% of the frame (someone walking past the lens) and people outside the court
-  margins (friends at the net post, people sitting on the side).
-- **Gap fill:** fill a short identity gap only when a detection is within 0.8 m of the interpolated track and still
-  resembles the selected clothing sample.
-- **Despike:** a single frame more than 0.9 m away from both neighbours (which agree with each other) is a mix-up.
-  Drop it.
-
-```json
-{"fps": 10.0, "frames": [{"t": 12.3, "r": [x, y], "rb": [box], "o": [x, y], "ob": [box]}, ...]}
+```sh
+./compress_application.sh
 ```
 
-`r` = you, `o` = opponent, positions in court metres. Annotated samples are written under `review/tracking/`.
-
-### [4] Serve candidates
-
-- Smooth positions over 0.5 s (box jitter), then compute speed.
-- A candidate requires both players in opposite singles service areas, within the court's x margins, moving slowly
-  for at least 0.8 s. This stage does not infer who served; the next stage visually confirms that.
-- The default manual Stage 5 review records server and service court from contact sheets.
-
-### [4a] Experimental shuttle tracking (optional)
-
-- `scripts/04a_shuttle_track.py` uses OpenCV bright-motion regions to create short pixel-space tracklets without a shuttle-specific model or network service.
-- Lines, lights, compression, and motion blur can produce false or missing tracks. The output can add visual path and direction-change cues to the overlay, but it is not a calibrated 3D trajectory.
-- It does not classify clears, drops, smashes, racket contact, or stroke technique. Use it as a visual aid and inspect the overlay.
-
-### [4b] Serve-player association (optional)
-
-- `scripts/04b_serve_analysis.py` checks early shuttle-like detections against the two tracked player boxes and writes a server suggestion for each Stage 4 candidate.
-- Stage 5 uses only high-confidence suggestions automatically. It asks you to review suggestions without enough shuttle evidence. These are heuristics, not a trained serve recognizer.
-
-### [5] Score replay
-
-- Singles rule: the **winner of a rally serves the next one**. So the server of serve N+1 is the winner of point N.
-- The default `--review-mode manual` keeps the current contact-sheet workflow, including candidate discard/add, court-side entry, and game breaks.
-- Optional `--review-mode assisted` assumes one game per video. Enter the score before the first recorded point, final score, and first server. The point total is `final score total - starting score total`; for 10-10 to 21-18 this is 19 points.
-- Assisted mode stops if the serve-candidate count differs from that point total. It uses high-confidence server suggestions, reviews uncertain serves, infers each earlier point winner from the next server, and checks the replay against the final score. Service court is calculated from the server's score parity.
-- A matching candidate count cannot prove every serve is correct: one false candidate can mask one missed serve. Recheck manually if a score replay fails or the video has long breaks/game resets.
-
-### [6] Rally ends
-
-- **Do not use racket sounds in a hall with more than one court.** My first version did, and other courts' hits made
-  rallies look twice as long (wrong by more than 1 s on 52 of 64 points).
-- The default manual mode writes a contact sheet per point (one frame every 0.5 s) and asks for the last live-play timestamp.
-- Assisted mode estimates a boundary when both tracked players remain nearly still after live play, and sends uncertain points through the same manual review. A long pause can also happen during a rally, so check automatic intervals before relying on rally-length statistics.
-- The optional shuttle tracker is experimental and is not reliable enough to replace rally-end review or identify stroke technique.
-
-```json
-{"n": 21, "t": 236.1, "next_t": 247.0, "server": "R", "side": "right", "before": "8-12", "winner": "O",
- "after": "8-13", "r0": 236.1, "r1": 237.85, "rdur": 1.75}
-```
-
-### [7] Movement
-
-Per rally (serve + 0.3 s to the rally end), for each player, in his own half (distance from his own baseline, and
-across from his own left sideline, so both players compare directly):
-
-- Smooth over 0.7 s before summing distance (jitter otherwise adds about 30%).
-- Distance, average and peak speed, share of time in the back court (within 1.6 m of the baseline) and front court
-  (past the short service line), median position.
-- **Trips out of position:** moments at least 2.2 m from the base point (centre line, 3.4 m from the baseline), and
-  how far away he still is 1 s later (recovery).
-- Heatmap of each player's half (`numpy.histogram2d` drawn with matplotlib).
-
-### [8] Body position (pose)
-
-- Run the free YOLO11n-pose model on a square crop around the identified player's box (1.35x the box size), sampled
-  at about 10 fps.
-- 2D knee angles are viewpoint-dependent, so compare these pose measures within one video and one camera setup:
-  - **crouch** = how much lower the hips are than when standing upright: hip-to-ankle height divided by torso
-    length, compared with your own upright frames between points.
-  - **stance width** = ankle-to-ankle distance divided by shoulder width.
-  - **racket arm up** = a wrist above the shoulders (prepared).
-- Contexts: **READY** = during a rally, moving slower than 0.8 m/s and within 1.6 m of base (waiting for the shot),
-  FRONT (near the net), REAR (near the baseline). Compare points **won vs lost**.
-
-### [9] Where the point ended (pickups)
-
-- After a rally someone may bend to pick the shuttle up. The script estimates standing box height by court-depth
-  bins, then treats a slow box below 72% of that estimate as a possible bend.
-- The first slow post-rally bend is saved as a pickup-side clue. It is a rough estimate and should be visually
-  confirmed alongside the winner and contact-sheet frames; the script does not label a specific shot error from
-  this clue alone.
-
-### [10] Report and coaching
-
-- Put every number in one place, split by **points won vs lost** and by **rally length** (5 s or less, 5-10 s, over
-  10 s). The biggest differences are the lessons.
-- Stage 10 writes a deterministic local report with outcome comparisons and timestamp-linked review suggestions.
-  For an optional local AI draft, install Ollama and a free model, start its local server, and run:
-
-  ```sh
-  brew install ollama
-  # In a separate terminal:
-  ollama serve
-  # Back in this terminal:
-  ollama pull llama3.2:3b
-  python scripts/10_report.py --job "$MATCH_JOB" --ollama-model llama3.2:3b
-  ```
-
-  The draft is saved as `coach_draft.md`; review every claim against its cited footage.
-
-### [11] The video (optional)
-
-Stage 11 renders `overlay.mp4` at the proxy's frame rate and resolution, with source audio during the match footage. The default has enlarged foot rings and player trails, a camera-oriented court map, a two-row scorecard with uppercase names, and an appended 30-second movement timelapse with an accumulating heatmap. The default boxes are the scorecard and court map; skeleton, the extra details box, shuttle marks, and stats graphs are off. Use `--show-skeleton` to include Stage 8 pose samples, `--show-details` to add a box under the scorecard with game/point/server/status/time, `--show-shuttle` to draw experimental shuttle paths, and `--show-stats` to add two animated, explained charts after the heatmap. Stats need `motion.json` from Stage 7. Use `--no-heatmap-clip` to omit the ending or `--heatmap-seconds 45` to change its duration. The near side of the court map is at the bottom, matching the behind-baseline camera view.
-
-### [12] Coach voice-over (optional)
-
-Run `scripts/12_voiceover.py --job "$MATCH_JOB"` after Stage 11. It reads the reviewed score and movement summary, optionally includes the first coaching note from `report.md`, and uses the built-in macOS `say` voice to create narration locally. It writes an audio file, the narration text, and `overlay_with_voiceover.mp4`. Narration starts over the heatmap ending, or over the stats graphs when Stage 11 was run with `--show-stats`. If speech runs longer than the video, the final frame is held until the narration finishes.
-
----
-
-## 5. Checks before you trust any number
-
-1. The court drawn back from `H` sits on the real lines (every camera position).
-2. A sample of tracked frames: the dot is on **your** feet, not on a friend at the net post.
-3. Every serve on the contact sheets: right server, right side. The service-court rule has 0 contradictions.
-4. Rally ends from the picture, not from sound.
-5. Distances look human: around 1 m/s average during live play in singles.
-
-
+The archive is written under `dist/` with a timestamped name. It contains the scripts, documentation, requirements, and any local ONNX/Pose model files under `models/`. It excludes `runs/`, `.venv`, Git metadata, and caches. Move and extract the ZIP on the other Mac, then follow the installation and model setup sections above; virtual environments are not portable between Macs. You can pass an alternate archive path as the script's only argument; relative paths are resolved from the project directory, for example `./compress_application.sh /tmp/badminton-analyser.zip`.

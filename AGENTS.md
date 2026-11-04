@@ -2,20 +2,29 @@
 
 ## Project Structure & Module Organization
 
-`README.md` describes the pipeline and commands. Runnable code lives in `scripts/`: `00_proxy.py` creates a per-video proxy and job manifest; `01`–`11` implement detection through overlay rendering; `common.py` holds shared helpers; `init_macos.sh` installs local prerequisites. Generated videos, stage JSON, previews, and reports belong under `runs/`, which is ignored by Git. Keep future modules grouped by pipeline stage and reusable samples or fixtures in clearly named directories.
+- `scripts/` contains one executable Python module per pipeline stage (`stage0_proxy.py` through `stage11_video.py`), including optional Stage 10A coaching.
+- `README.md` covers setup and review checkpoints; `command_pipeline.md` contains runnable stage commands.
+- `runs/<match-name>/` holds per-match source video, generated JSON, contact sheets, review files, and rendered videos. Run contents are Git-ignored.
+- `models/` holds local model weights and is Git-ignored. The package script includes ONNX and MediaPipe task weights when present.
+
+Keep runtime outputs out of the repository root. Update the README and command examples when script behavior, arguments, or output formats change.
 
 ## Build, Test, and Development Commands
 
-Initialize the macOS environment with `bash scripts/init_macos.sh`, activate it with `source .venv/bin/activate`, then run the ordered per-video commands in `README.md`. The initializer detects Intel or Apple Silicon and selects native Homebrew; stages 1 and 8 use locally run Ultralytics models (MPS when available, otherwise CPU). No automated test or lint command is configured. Document setup and exact commands here and in the README as tools are added.
+Create `.venv` with Python 3.11, install `requirements.txt`, and install FFmpeg with `ffprobe` as described in `README.md`. Run an individual stage with `.venv/bin/python scripts/stageN_name.py ...`; direct its generated files to that match's `runs/<match-name>/` directory. There is no automated test suite currently. Do not add or run tests unless requested; use source review for documentation-only changes.
 
 ## Coding Style & Naming Conventions
 
-Keep pipeline stages small and make input and output formats explicit. Use descriptive stage names consistent with the README (`players`, `serves`, `motion`, `pose_stats`). For Python code, use four-space indentation and `snake_case`; for JSON outputs, preserve the documented field meanings and use valid JSON numbers and strings. Document court coordinates in metres, with the camera behind the near baseline, so stages interpret positions consistently. Avoid silently guessing player identity when detections are uncertain; represent gaps explicitly.
+For Python modules, use four spaces for indentation, descriptive `snake_case` names, and small functions aligned with the pipeline stages. Keep time, court coordinates, and distances in explicit units. Preserve the documented court coordinate system: `x` spans 0–6.1 m and `y` spans 0–13.4 m. Use clear, consistent JSON field names and update examples when schemas change.
 
 ## Testing Guidelines
 
-No automated test framework or coverage target exists yet. For changes to analysis logic, add focused tests alongside the chosen framework. Validate results against sample frames and the README's manual checks: projected court lines align with the court, tracked points land on player feet, serve and side assignments agree with the service-court rule, rally ends are checked visually, and movement distances are plausible. Include the data or frame timestamps used for manual checks in the change description.
+There is no test framework or test suite yet. If one is introduced, cover court-coordinate transforms, scoring rules, and missing or noisy detections with synthetic inputs that do not depend on private match footage. Document its command before relying on it.
 
 ## Commit & Pull Request Guidelines
 
-This checkout has no Git history to establish a commit convention. Use short, imperative commit subjects, such as `Document rally validation`. Pull requests should summarize the affected pipeline stages, explain any output schema changes, link related work when applicable, and include test results or representative frame screenshots for visual changes. Update `README.md` when behavior or setup instructions change.
+Use short, imperative commit subjects (for example, `Document calibration workflow`). Do not commit match videos, model weights, generated run data, or machine-specific paths. Pull requests should explain the change and its validation, link related issues when applicable, and include representative before/after images for changes to generated charts or video overlays.
+
+## Security & Configuration
+
+Do not commit match videos, credentials, or machine-specific paths. Keep optional model weights and generated analysis outputs outside version control unless a small, redistributable fixture is needed for development.
