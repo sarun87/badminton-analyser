@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Estimate the Stage 3 selected player's posture from MediaPipe Pose Landmarker crops."""
+"""Estimate either Stage 3 player's posture from MediaPipe Pose Landmarker crops."""
 
 from __future__ import annotations
 
@@ -43,6 +43,12 @@ def point2(value: Any) -> tuple[float, float] | None:
     return float(value[0]), float(value[1])
 
 
+def other_player(player_code: str) -> str:
+    if player_code not in ("R", "O"):
+        raise ValueError("player code must be R or O")
+    return "O" if player_code == "R" else "R"
+
+
 def load_inputs(
     players_path: Path, review_path: Path
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
@@ -71,10 +77,11 @@ def load_inputs(
 
 
 def smooth_positions(
-    frames: list[dict[str, Any]], fps: float
+    frames: list[dict[str, Any]], fps: float, player_code: str = "R"
 ) -> tuple[list[float], list[tuple[float, float] | None], list[float | None]]:
+    other_player(player_code)
     times = [float(frame["t"]) for frame in frames]
-    raw = [point2(frame.get("r")) for frame in frames]
+    raw = [point2(frame.get(player_code.lower())) for frame in frames]
     raw = [
         (6.1 - point[0], 13.4 - point[1]) if point is not None and point[1] >= 6.7 else point
         for point in raw
@@ -228,6 +235,62 @@ def posture_metrics(landmarks: list[Any], side: int) -> dict[str, Any]:
     }
 
 
+def select_pose_for_box(
+    candidates: list[list[Any]],
+    normalized_box: Any,
+    origin_x: int,
+    origin_y: int,
+    side: int,
+    frame_width: int,
+    frame_height: int,
+) -> list[Any] | None:
+    """Pick an O pose candidate whose torso aligns with O's tracked person box."""
+    if not isinstance(normalized_box, list) or len(normalized_box) < 4:
+        return None
+    x1, y1, x2, y2 = [float(value) for value in normalized_box[:4]]
+    if not all(math.isfinite(value) for value in (x1, y1, x2, y2)) or x2 <= x1 or y2 <= y1:
+        return None
+    box_x1, box_y1 = x1 * frame_width, y1 * frame_height
+    box_x2, box_y2 = x2 * frame_width, y2 * frame_height
+    box_width, box_height = box_x2 - box_x1, box_y2 - box_y1
+    # The detector box can be slightly tight, so allow modest space around it.
+    margin_x = max(8.0, box_width * 0.3)
+    margin_y = max(8.0, box_height * 0.2)
+    expanded = (box_x1 - margin_x, box_y1 - margin_y, box_x2 + margin_x, box_y2 + margin_y)
+
+    matches = []
+    for landmarks in candidates:
+        if len(landmarks) < 25:
+            continue
+        torso = []
+        for index in (11, 12, 23, 24):
+            landmark = landmarks[index]
+            visibility = landmark_visibility(landmark)
+            if visibility < POSE_VISIBILITY:
+                continue
+            px = float(landmark.x) * side + origin_x
+            py = float(landmark.y) * side + origin_y
+            torso.append((px, py, visibility))
+        if len(torso) < 2:
+            continue
+        inside = sum(
+            expanded[0] <= px <= expanded[2] and expanded[1] <= py <= expanded[3]
+            for px, py, _ in torso
+        )
+        required = max(2, math.ceil(len(torso) * 0.6))
+        if inside < required:
+            continue
+        center_x = sum(point[0] for point in torso) / len(torso)
+        center_y = sum(point[1] for point in torso) / len(torso)
+        center_distance = (
+            ((center_x - (box_x1 + box_x2) / 2) / max(box_width, 1.0)) ** 2
+            + ((center_y - (box_y1 + box_y2) / 2) / max(box_height, 1.0)) ** 2
+        )
+        mean_visibility = sum(point[2] for point in torso) / len(torso)
+        matches.append(((inside, mean_visibility, -center_distance), landmarks))
+    return max(matches, key=lambda match: match[0])[1] if matches else None
+
+
 def infer_racket_side(records: list[dict[str, Any]]) -> dict[str, Any]:
     rates = {}
     for side in ("left", "right"):
@@ -269,7 +332,7 @@ def share(records: list[dict[str, Any]], key: str) -> float | None:
     return None if not values else round(sum(values) / len(values), 3)
 
 
-def write_preview(path: Path, previews: list[dict[str, Any]], racket_side: str) -> None:
+def write_preview(path: Path, previews: list[dict[str, Any]], racket_side: str, player_code: str = "R") -> None:
     tile_size = 320
     columns = 4
     rows = max(1, math.ceil(len(previews) / columns))
@@ -300,7 +363,7 @@ def write_preview(path: Path, previews: list[dict[str, Any]], racket_side: str) 
         )
         cv2.putText(sheet, label[:52], (x0 + 5, y0 + tile_size + 25), cv2.FONT_HERSHEY_SIMPLEX,
                     0.42, (255, 255, 255), 1, cv2.LINE_AA)
-    title = f"Pose preview | racket side: {racket_side}"
+    title = f"Pose preview | racket side: {racket_side}" if player_code == "R" else f"Pose preview O | racket side: {racket_side}"
     sheet = cv2.copyMakeBorder(sheet, 34, 0, 0, 0, cv2.BORDER_CONSTANT, value=(32, 32, 32))
     cv2.putText(sheet, title, (8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -309,13 +372,15 @@ def write_preview(path: Path, previews: list[dict[str, Any]], racket_side: str) 
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Analyze the Stage 3 selected R player's pose from track crops.")
+    parser = argparse.ArgumentParser(description="Analyze either Stage 3 player's pose from track crops.")
     parser.add_argument("input_video", type=Path, help="Stage 0 720p proxy video")
     parser.add_argument("players_json", type=Path, help="Stage 3 players.json")
     parser.add_argument("rallies_review_json", type=Path, help="Stage 6 review JSON with rally times")
     parser.add_argument("model_task", type=Path, help="MediaPipe pose_landmarker_heavy.task")
     parser.add_argument("output_json", type=Path, help="pose_stats.json output")
     parser.add_argument("preview_image", type=Path, help="pose_review.jpg output")
+    parser.add_argument("--player-code", choices=("R", "O"), default="R",
+                        help="Stage 3 player identity to analyze (default: R)")
     parser.add_argument("--racket-side", choices=("auto", "left", "right"), default="auto")
     parser.add_argument("--crop-scale", type=float, default=CROP_SCALE)
     parser.add_argument("--overwrite", action="store_true", help="replace existing pose outputs")
@@ -354,7 +419,7 @@ def main() -> int:
         raise RuntimeError("MediaPipe Tasks is unavailable; install mediapipe in the project .venv") from error
 
     frames, rallies, track_fps = load_inputs(players_path, review_path)
-    times, smooth, speeds = smooth_positions(frames, track_fps)
+    times, smooth, speeds = smooth_positions(frames, track_fps, args.player_code)
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"OpenCV could not open video: {video_path}")
@@ -387,7 +452,7 @@ def main() -> int:
     options = vision.PoseLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
-        num_poses=1,
+        num_poses=2 if args.player_code == "O" else 1,
         min_pose_detection_confidence=0.35,
         min_pose_presence_confidence=0.35,
         min_tracking_confidence=0.35,
@@ -396,6 +461,7 @@ def main() -> int:
     records: list[dict[str, Any]] = []
     previews: list[dict[str, Any]] = []
     preview_counts: dict[str, int] = {}
+    identity_rejected_count = 0
     current_frame = -1
     try:
         for index, track_frame in enumerate(frames):
@@ -411,7 +477,8 @@ def main() -> int:
                 continue
             if not sample_flags[index]:
                 continue
-            crop_data = player_crop(frame, track_frame.get("rb"), args.crop_scale)
+            track_box_key = f"{args.player_code.lower()}b"
+            crop_data = player_crop(frame, track_frame.get(track_box_key), args.crop_scale)
             if crop_data is None:
                 continue
             crop, origin_x, origin_y, side = crop_data
@@ -421,12 +488,27 @@ def main() -> int:
             if not result.pose_landmarks:
                 continue
 
-            pose = posture_metrics(result.pose_landmarks[0], side)
+            if args.player_code == "O":
+                selected_landmarks = select_pose_for_box(
+                    result.pose_landmarks,
+                    track_frame.get(track_box_key),
+                    origin_x,
+                    origin_y,
+                    side,
+                    frame.shape[1],
+                    frame.shape[0],
+                )
+                if selected_landmarks is None:
+                    identity_rejected_count += 1
+                    continue
+            else:
+                selected_landmarks = result.pose_landmarks[0]
+            pose = posture_metrics(selected_landmarks, side)
             point, context = point_contexts[index]
             record: dict[str, Any] = {
                 "t": round(timestamp, 3),
                 "point_n": None if point is None else point["point_n"],
-                "outcome": None if point is None else ("won" if point.get("winner") == "R" else "lost"),
+                "outcome": None if point is None else ("won" if point.get("winner") == args.player_code else "lost"),
                 "context": context,
                 "between_points_upright_candidate": baseline_flags[index],
                 "speed_m_s": None if speeds[index] is None else round(speeds[index], 3),
@@ -512,14 +594,18 @@ def main() -> int:
     for item in previews:
         record = preview_metrics[round(item["t"], 3)]
         item["crouch_pct_vs_upright"] = record.get("crouch_pct_vs_upright")
-    write_preview(preview_path, previews, racket_side)
+    write_preview(preview_path, previews, racket_side, args.player_code)
 
     output = {
         "source_video": video_path.name,
         "source_players_json": players_path.name,
         "source_rallies_review_json": review_path.name,
         "model": model_path.name,
-        "player": "R (selected in Stage 3 by clothing color)",
+        "player": (
+            "R (selected in Stage 3 by clothing color)" if args.player_code == "R"
+            else "O (other player identified in Stage 3)"
+        ),
+        "player_code": args.player_code,
         "analysis_fps": track_fps,
         "crop_scale": args.crop_scale,
         "contexts": {
@@ -531,6 +617,12 @@ def main() -> int:
         "upright_reference_method": upright_reference_method,
         "racket_side": racket_side,
         "racket_side_inference": racket_inference,
+        "pose_identity_filter": {
+            "enabled": args.player_code == "O",
+            "method": "up to two MediaPipe poses; retain the candidate whose visible torso landmarks overlap the O detection box"
+            if args.player_code == "O" else "not applied to preserve the established R pose path",
+            "rejected_frame_count": identity_rejected_count,
+        },
         "summary_by_outcome_and_context": grouped,
         "points": per_point,
         "frames": records,

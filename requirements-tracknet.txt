@@ -1,0 +1,9 @@
+# Install only into TrackNet's separate virtual environment, never the base pipeline .venv.
+torch>=2.1
+numpy<2
+opencv-python>=4.8
+pandas
+Pillow
+parse
+tqdm
+pycocotools

@@ -1,0 +1,53 @@
+{
+  "score_order": "R-O",
+  "initial_score": {"R": 0, "O": 0},
+  "serves": [
+    {
+      "n": 1,
+      "candidate_n": 1,
+      "server": "R",
+      "side": "right",
+      "score_before": {"R": 0, "O": 0}
+    },
+    {
+      "n": 2,
+      "candidate_n": null,
+      "dummy_point": true,
+      "timestamp_sec": 0,
+      "server": "O",
+      "side": "left",
+      "score_before": {"R": 0, "O": 1},
+      "note": "Example score-only point that was not recorded during the match"
+    },
+    {
+      "n": 3,
+      "candidate_n": 2,
+      "server": "R",
+      "side": "left",
+      "score_before": {"R": 1, "O": 1}
+    },
+    {
+      "n": 4,
+      "candidate_n": null,
+      "dummy_point": true,
+      "timestamp_sec": 0,
+      "server": "O",
+      "side": "right",
+      "score_before": {"R": 1, "O": 2},
+      "note": "Second example score-only point; delete if not needed"
+    },
+    {
+      "n": 5,
+      "candidate_n": 3,
+      "server": "R",
+      "side": "right",
+      "score_before": {"R": 2, "O": 2}
+    }
+  ],
+  "final_point_winner": "O",
+  "final_score": {"R": 2, "O": 3},
+  "notes": [
+    "TEMPLATE EXAMPLE ONLY: replace the candidate IDs, serve rows, score-before values, winners, final score, and notes for this match.",
+    "Include every accepted Stage 4 candidate exactly once. Keep dummy_point true and timestamp_sec 0 only for score-only points not recorded in the video."
+  ]
+}

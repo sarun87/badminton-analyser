@@ -31,8 +31,8 @@ def parse_score(value: Any, label: str) -> dict[str, int]:
 def load_events(path: Path) -> dict[int, dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     events = data.get("events")
-    if not isinstance(events, list) or not events:
-        raise ValueError("serves JSON must contain a non-empty events array")
+    if not isinstance(events, list):
+        raise ValueError("serves JSON must contain an events array")
     result = {}
     for event in events:
         candidate = event.get("candidate_n", event.get("n"))
@@ -171,7 +171,11 @@ def replay(rows: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
                 "dummy_score_point_not_in_video" if dummy_point else
                 event.get("review_status", "detected") if event else "manual_row_without_detected_candidate"
             ),
-            "detected_guess": {"server": event.get("server"), "side": event.get("side")} if event else None,
+            "detected_guess": {
+                "server": event.get("server"),
+                "side": event.get("side"),
+                "tracknet_server_cue": event.get("tracknet_serve_cue"),
+            } if event else None,
             "manual_note": row["note"], "dummy_point": dummy_point,
         })
         replay_score = after
@@ -239,6 +243,8 @@ def main() -> int:
     if output.exists() and not args.overwrite:
         parser.error(f"output already exists: {output} (pass --overwrite)")
     events = load_events(source)
+    if not events and review is None:
+        raise ValueError("serves JSON has no detected candidates; provide a manual review with timestamped serve rows")
     rows, meta = load_review(review, events) if review else automatic_rows(events)
     result = replay(rows, meta)
     serve_data = json.loads(source.read_text(encoding="utf-8"))
