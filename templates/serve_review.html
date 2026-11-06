@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Badminton Serve Review</title>
+  <style>
+    :root { color-scheme: dark; --bg:#10141a; --panel:#191f28; --panel2:#202834; --line:#303b49; --text:#edf2f7; --muted:#a9b5c2; --accent:#5bd6c0; --red:#ff7272; --gold:#f4c86a; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font:15px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+    header { position:sticky; top:0; z-index:3; padding:16px 22px; background:#111820f2; border-bottom:1px solid var(--line); display:flex; gap:20px; align-items:center; justify-content:space-between; }
+    h1,h2,h3,p { margin:0; }
+    h1 { font-size:20px; letter-spacing:.01em; }
+    h2 { font-size:18px; margin-bottom:12px; }
+    h3 { font-size:15px; }
+    .sub { color:var(--muted); font-size:13px; margin-top:3px; }
+    .badge { color:var(--accent); border:1px solid #368b7d; border-radius:999px; padding:4px 9px; font-size:11px; font-weight:700; letter-spacing:.07em; white-space:nowrap; }
+    button, select, input { color:var(--text); font:inherit; }
+    button { background:var(--panel2); border:1px solid #445365; border-radius:8px; padding:8px 12px; cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    button.primary { background:var(--accent); color:#07211e; border:0; font-weight:750; padding:10px 17px; }
+    button.danger { color:#ffd6d6; border-color:#874a51; }
+    button.small { padding:4px 8px; font-size:12px; }
+    select, input { background:#111820; border:1px solid #445365; border-radius:7px; padding:7px 9px; }
+    input[type=number] { width:112px; }
+    .timeline-time { width:126px !important; }
+    main { max-width:1500px; margin:0 auto; padding:20px; }
+    .grid { display:grid; grid-template-columns:280px minmax(0,1fr); gap:16px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px; }
+    .candidate-nav { max-height:70vh; overflow:auto; display:flex; flex-direction:column; gap:6px; }
+    .candidate-nav button { display:flex; justify-content:space-between; gap:10px; text-align:left; width:100%; background:#151b23; }
+    .candidate-nav button.active { outline:2px solid var(--accent); }
+    .candidate-nav button.rejected { opacity:.55; }
+    .time { color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+    .candidate-header { display:flex; justify-content:space-between; align-items:flex-start; gap:15px; margin-bottom:12px; }
+    .preview { width:100%; background:#090c10; border-radius:8px; min-height:220px; display:flex; align-items:center; justify-content:center; overflow:auto; }
+    .preview img { display:block; max-width:100%; max-height:68vh; object-fit:contain; }
+    .zoom-section { margin-top:14px; }
+    .zoom-section h3 { margin-bottom:3px; }
+    .zoom-section .preview { min-height:120px; margin-top:8px; }
+    .candidate-form { margin-top:14px; display:grid; grid-template-columns:repeat(4,minmax(120px,1fr)); gap:12px; }
+    label { display:flex; flex-direction:column; gap:5px; color:var(--muted); font-size:12px; }
+    label.inline { flex-direction:row; align-items:center; font-size:14px; color:var(--text); }
+    label.inline input { width:18px; height:18px; accent-color:var(--accent); }
+    .field-title { font-weight:650; color:var(--text); }
+    .cue { grid-column:span 2; display:flex; align-items:flex-end; gap:8px; }
+    .cue label { flex:1; }
+    .guess { color:var(--muted); font-size:13px; margin-top:10px; }
+    .section { margin-top:18px; }
+    .score-controls { display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end; margin-bottom:15px; }
+    .score-controls label { min-width:105px; }
+    .inline-pair { display:flex; gap:8px; }
+    .add-row { display:flex; flex-wrap:wrap; align-items:flex-end; gap:10px; padding:12px; background:#141a22; border:1px solid var(--line); border-radius:9px; margin-bottom:10px; }
+    .add-row h3 { flex-basis:100%; }
+    .timeline-wrap { overflow-x:auto; }
+    table { width:100%; border-collapse:collapse; min-width:780px; }
+    th,td { padding:8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:middle; }
+    th { color:var(--muted); font-size:12px; font-weight:600; }
+    td select { min-width:90px; }
+    .score { font-variant-numeric:tabular-nums; color:#d4e4ef; white-space:nowrap; }
+    .row-actions { display:flex; gap:5px; }
+    .muted { color:var(--muted); }
+    .warning { color:var(--gold); margin:10px 0; }
+    .success { color:var(--accent); }
+    .error { color:var(--red); }
+    #saveStatus { margin-left:10px; font-size:13px; }
+    .bottom { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-top:15px; }
+    #manualPreview { display:none; max-width:480px; max-height:270px; border-radius:8px; margin:8px 0; border:1px solid var(--line); }
+    @media (max-width:900px) { .grid { grid-template-columns:1fr; } .candidate-nav { max-height:220px; display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); } .candidate-form { grid-template-columns:repeat(2,minmax(120px,1fr)); } header { position:static; } }
+  </style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Serve review</h1>
+    <p class="sub" id="videoLabel">Loading match…</p>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px"><span class="badge">LOCAL ONLY</span><button class="primary" id="saveTop">Save review</button></div>
+</header>
+<main>
+  <div class="grid">
+    <section class="panel">
+      <div class="candidate-header"><div><h2>Candidates</h2><p class="sub" id="candidateCount"></p></div><span class="badge">R / O</span></div>
+      <div class="candidate-nav" id="candidateNav"></div>
+    </section>
+    <section class="panel">
+      <div class="candidate-header">
+        <div><h2 id="candidateTitle">Select a candidate</h2><p class="sub" id="candidateMeta"></p></div>
+        <div style="display:flex;gap:8px"><button id="previousCandidate">← Previous</button><button id="nextCandidate">Next →</button></div>
+      </div>
+      <div class="preview"><img id="candidateImage" alt="Serve candidate review frames"></div>
+      <div class="zoom-section">
+        <h3>Player close-ups (no tracking boxes)</h3>
+        <p class="sub">R and O are cropped from the same review moments to make racket position easier to inspect.</p>
+        <div class="preview"><img id="candidateZoomImage" alt="Unannotated zoomed crops of players R and O"></div>
+      </div>
+      <div id="candidateControls" class="candidate-form" hidden>
+        <label class="inline"><input id="accepted" type="checkbox"><span>Accept as a serve</span></label>
+        <label>Server<select id="server"><option value="">Choose…</option><option>R</option><option>O</option></select></label>
+        <label>Server court (server's perspective)<select id="side"><option value="">Choose…</option><option value="left">Left</option><option value="right">Right</option></select></label>
+        <div class="cue">
+          <label>R racket<select id="racketR"><option>unclear</option><option>up</option><option>sideways</option><option>down</option></select></label>
+          <label>O racket<select id="racketO"><option>unclear</option><option>up</option><option>sideways</option><option>down</option></select></label>
+          <button id="useRacket">Use racket cue</button>
+        </div>
+      </div>
+      <p class="guess" id="guessText"></p>
+    </section>
+  </div>
+
+  <section class="panel section">
+    <h2>Serve order and score</h2>
+    <p class="sub" style="margin-bottom:14px">Rows are ordered by timestamp. The next serve's server determines the previous rally winner, so score-before values recalculate when you correct or insert a serve.</p>
+    <div class="score-controls">
+      <label>Starting R score<input id="initialR" type="number" min="0" step="1"></label>
+      <label>Starting O score<input id="initialO" type="number" min="0" step="1"></label>
+      <label>Final point winner<select id="finalWinner"><option value="">Unknown / not entered</option><option>R</option><option>O</option></select></label>
+      <div class="score">Calculated final score: <strong id="finalScore">—</strong></div>
+    </div>
+    <div class="add-row">
+      <h3>Add a missed serve visible in the video</h3>
+      <label>Proxy timestamp (seconds)<input id="manualTime" type="number" min="0.001" step="0.01" placeholder="e.g. 145.2"></label>
+      <label>Server<select id="manualServer"><option value="">Choose…</option><option>R</option><option>O</option></select></label>
+      <label>Server court (server's perspective)<select id="manualSide"><option value="">Choose…</option><option value="left">Left</option><option value="right">Right</option></select></label>
+      <button id="previewManual">Preview timestamp</button>
+      <button class="primary" id="addManual">Add serve</button>
+      <img id="manualPreview" alt="Frame preview at the entered timestamp">
+    </div>
+    <div class="add-row">
+      <h3>Add an uncounted point (score-only; skipped by video-time analysis)</h3>
+      <label>Server for this point<select id="dummyServer"><option value="">Choose…</option><option>R</option><option>O</option></select></label>
+      <label>Server court (server's perspective)<select id="dummySide"><option value="">Choose…</option><option value="left">Left</option><option value="right">Right</option></select></label>
+      <label>Insert after serve<select id="dummyAfter"><option value="0">Beginning</option></select></label>
+      <button class="primary" id="addDummy">Add score-only point</button>
+    </div>
+    <p class="warning" id="timelineWarning" hidden></p>
+    <p class="warning" id="missingTimeWarning" hidden>One or more manual serves has no timestamp. It can be saved for Stage 5, but Stage 6 needs a timestamp to place it in the video timeline.</p>
+    <div class="timeline-wrap">
+      <table>
+        <thead><tr><th>n</th><th>Proxy time</th><th>Type</th><th>Server</th><th>Server court</th><th>Score before</th><th>Order / remove</th></tr></thead>
+        <tbody id="timelineBody"></tbody>
+      </table>
+    </div>
+    <div class="bottom">
+      <p class="sub">Save writes <code>serves_reviewed.json</code> and <code>manual_score_review.json</code>. Use the reviewed serves file in Stage 5.</p>
+      <div><span id="saveStatus"></span><button class="primary" id="saveBottom">Save review</button></div>
+    </div>
+  </section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+let state, candidates = [], timeline = [], selectedId = null, manualCounter = 0, dummyCounter = 0;
+
+function candidateById(id) { return candidates.find((row) => row.candidate_n === id); }
+function entryTime(entry) {
+  if (entry.kind === "candidate") return Number(candidateById(entry.candidate_n)?.t || 0);
+  if (entry.kind === "dummy" || entry.timestamp_sec == null) return null;
+  return Number(entry.timestamp_sec);
+}
+function serverFor(entry) { return entry.kind === "candidate" ? candidateById(entry.candidate_n)?.server : entry.server; }
+function sideFor(entry) { return entry.kind === "candidate" ? candidateById(entry.candidate_n)?.side : entry.side; }
+function setServer(entry, value) {
+  if (entry.kind === "candidate") candidateById(entry.candidate_n).server = value;
+  else entry.server = value;
+}
+function setSide(entry, value) {
+  if (entry.kind === "candidate") candidateById(entry.candidate_n).side = value;
+  else entry.side = value;
+}
+function esc(value) { return String(value ?? "").replace(/[&<>\"]/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function renderNav() {
+  const nav = $("candidateNav");
+  nav.innerHTML = "";
+  const ordered = [...candidates].sort((a,b) => a.t - b.t);
+  $("candidateCount").textContent = `${ordered.filter(c=>c.accepted).length} accepted · ${ordered.length} total`;
+  for (const candidate of ordered) {
+    const button = document.createElement("button");
+    button.className = `${candidate.candidate_n === selectedId ? "active " : ""}${candidate.accepted ? "" : "rejected"}`;
+    button.innerHTML = `<span>Candidate ${candidate.candidate_n} ${candidate.accepted ? "" : "· rejected"}</span><span class="time">${candidate.t.toFixed(1)}s</span>`;
+    button.onclick = () => { selectedId = candidate.candidate_n; renderNav(); renderCandidate(); };
+    nav.appendChild(button);
+  }
+}
+
+function renderCandidate() {
+  const candidate = candidateById(selectedId);
+  const controls = $("candidateControls");
+  if (!candidate) {
+    controls.hidden = true;
+    $("candidateTitle").textContent = "No candidates detected";
+    $("candidateImage").style.display = "none";
+    $("candidateZoomImage").style.display = "none";
+    return;
+  }
+  controls.hidden = false;
+  $("candidateTitle").textContent = `Candidate ${candidate.candidate_n}`;
+  const netGuess = candidate.net_server_guess || candidate.position_server_guess || "unknown";
+  const netAgreement = candidate.net_heuristic_agreement == null ? "?" : Number(candidate.net_heuristic_agreement).toFixed(2);
+  const centerlineGuess = candidate.centerline_server_guess || "inconclusive";
+  const centerlineAgreement = candidate.centerline_agreement == null ? "?" : Number(candidate.centerline_agreement).toFixed(2);
+  const shuttleCue = candidate.tracknet_serve_cue || {};
+  const shuttleRefinement = candidate.tracknet_server_refinement || {};
+  const shuttleText = shuttleRefinement.status === "applied"
+    ? ` · TrackNet applied: ${shuttleRefinement.server} serves, ${shuttleRefinement.receiver} receives (${Number(shuttleRefinement.confidence).toFixed(2)})`
+    : shuttleCue.server_hint
+      ? ` · TrackNet suggestion ${shuttleCue.server_hint} (${Number(shuttleCue.confidence || 0).toFixed(2)}; not applied)`
+      : shuttleCue.status ? ` · TrackNet cue ${shuttleCue.status.replaceAll("_", " ")}` : "";
+  $("candidateMeta").textContent = `at ${candidate.t.toFixed(2)}s · net pass ${netGuess} (${netAgreement}) · center-line pass ${centerlineGuess} (${centerlineAgreement})${shuttleText}`;
+  const image = $("candidateImage");
+  image.src = candidate.image_url || "";
+  image.style.display = candidate.image_url ? "block" : "none";
+  const zoomImage = $("candidateZoomImage");
+  zoomImage.src = candidate.zoom_image_url || "";
+  zoomImage.style.display = candidate.zoom_image_url ? "block" : "none";
+  $("accepted").checked = !!candidate.accepted;
+  $("server").value = candidate.server || "";
+  $("side").value = candidate.side || "";
+  $("racketR").value = candidate.racket_R || "unclear";
+  $("racketO").value = candidate.racket_O || "unclear";
+  const server = candidate.server || "unknown";
+  const receiver = candidate.receiver || "unknown";
+  const source = candidate.server_hint_method ? ` · ${candidate.server_hint_method}` : "";
+  $("guessText").textContent = `Current server/receiver guess: ${server} serves from ${candidate.side || "unknown"}; ${receiver} receives${source}`;
+}
+
+function insertByTime(entry) {
+  const time = entryTime(entry);
+  let index = timeline.findIndex((existing) => {
+    const existingTime = entryTime(existing);
+    return existing.kind !== "dummy" && existingTime !== null && existingTime > time;
+  });
+  if (index < 0) index = timeline.length;
+  timeline.splice(index, 0, entry);
+}
+
+function calcScores() {
+  const r0 = Math.max(0, Number($("initialR").value || 0));
+  const o0 = Math.max(0, Number($("initialO").value || 0));
+  let score = {R:r0, O:o0};
+  const before = [];
+  for (let i=0; i<timeline.length; i++) {
+    before.push({...score});
+    const nextServer = serverFor(timeline[i+1] || {});
+    if (nextServer === "R" || nextServer === "O") score[nextServer] += 1;
+  }
+  const winner = $("finalWinner").value;
+  let final = timeline.length ? {...before[before.length-1]} : {...score};
+  if (winner === "R" || winner === "O") final[winner] += 1;
+  $("finalScore").textContent = `${final.R}-${final.O}`;
+  return before;
+}
+
+function renderTimeline() {
+  const before = calcScores();
+  const body = $("timelineBody");
+  body.innerHTML = "";
+  timeline.forEach((entry, index) => {
+    const candidate = entry.kind === "candidate" ? candidateById(entry.candidate_n) : null;
+    const time = entryTime(entry);
+    const timestamp = entry.kind === "dummy" ? "Score-only" : entry.kind === "manual"
+      ? `<input class="timeline-time" type="number" min="0.001" step="0.01" data-time="${index}" value="${time ?? ""}" placeholder="Time needed">`
+      : `${time.toFixed(2)}s`;
+    const type = entry.kind === "candidate" ? `Candidate ${entry.candidate_n}` : entry.kind === "dummy" ? "Dummy point" : "Manual serve";
+    const tr = document.createElement("tr");
+    const serverSelect = `<select data-server="${index}"><option value="">Choose…</option><option value="R" ${serverFor(entry)==="R"?"selected":""}>R</option><option value="O" ${serverFor(entry)==="O"?"selected":""}>O</option></select>`;
+    const sideSelect = `<select data-side="${index}"><option value="">Choose…</option><option value="left" ${sideFor(entry)==="left"?"selected":""}>Left</option><option value="right" ${sideFor(entry)==="right"?"selected":""}>Right</option></select>`;
+    const actions = `<div class="row-actions"><button class="small" data-up="${index}" ${index===0?"disabled":""}>↑</button><button class="small" data-down="${index}" ${index===timeline.length-1?"disabled":""}>↓</button>${entry.kind==="candidate"?"":`<button class="small danger" data-delete="${index}">Delete</button>`}</div>`;
+    tr.innerHTML = `<td>${index+1}</td><td>${timestamp}</td><td>${type}</td><td>${serverSelect}</td><td>${sideSelect}</td><td class="score">${before[index].R}-${before[index].O}</td><td>${actions}</td>`;
+    body.appendChild(tr);
+  });
+  body.querySelectorAll("[data-server]").forEach(el => el.onchange = () => { const entry=timeline[Number(el.dataset.server)]; setServer(entry,el.value); if(entry.kind==="candidate"&&entry.candidate_n===selectedId) $("server").value=el.value; renderNav(); renderTimeline(); });
+  body.querySelectorAll("[data-side]").forEach(el => el.onchange = () => { const entry=timeline[Number(el.dataset.side)]; setSide(entry,el.value); if(entry.kind==="candidate"&&entry.candidate_n===selectedId) $("side").value=el.value; renderNav(); renderTimeline(); });
+  body.querySelectorAll("[data-time]").forEach(el => el.onchange = () => {
+    const entry=timeline[Number(el.dataset.time)];
+    const value=el.value.trim();
+    entry.timestamp_sec=value===""?null:Number(value);
+    renderTimeline();
+  });
+  body.querySelectorAll("[data-up]").forEach(el => el.onclick = () => moveEntry(Number(el.dataset.up), -1));
+  body.querySelectorAll("[data-down]").forEach(el => el.onclick = () => moveEntry(Number(el.dataset.down), 1));
+  body.querySelectorAll("[data-delete]").forEach(el => el.onclick = () => { timeline.splice(Number(el.dataset.delete),1); renderTimeline(); });
+  const nontimed = timeline.filter(e=>e.kind!=="dummy").map(entryTime).filter(t=>t!==null);
+  const ordered = nontimed.every((t,i)=>i===0||t>nontimed[i-1]);
+  $("timelineWarning").hidden = ordered;
+  $("timelineWarning").textContent = ordered ? "" : "Rows with video timestamps must be in strictly increasing order. Use the arrows to reorder them.";
+  $("missingTimeWarning").hidden = !timeline.some(e=>e.kind==="manual"&&entryTime(e)===null);
+  renderDummyPositionSelect();
+}
+
+function moveEntry(index, delta) {
+  const target = index + delta;
+  if (target < 0 || target >= timeline.length) return;
+  [timeline[index], timeline[target]] = [timeline[target], timeline[index]];
+  renderTimeline();
+}
+
+function renderDummyPositionSelect() {
+  const select = $("dummyAfter");
+  const current = select.value;
+  select.innerHTML = `<option value="0">Beginning</option>`;
+  timeline.forEach((entry,index)=>{
+    const label = entry.kind === "candidate" ? `After candidate ${entry.candidate_n}` : entry.kind === "dummy" ? "After dummy point" : "After manual serve";
+    select.insertAdjacentHTML("beforeend", `<option value="${index+1}">${index+1}. ${label}</option>`);
+  });
+  if ([...select.options].some(o=>o.value===current)) select.value=current;
+}
+
+function updateCandidate() {
+  const candidate = candidateById(selectedId);
+  if (!candidate) return;
+  const wasAccepted = candidate.accepted;
+  candidate.accepted = $("accepted").checked;
+  candidate.server = $("server").value;
+  candidate.receiver = candidate.server === "R" ? "O" : candidate.server === "O" ? "R" : "";
+  candidate.side = $("side").value;
+  candidate.racket_R = $("racketR").value;
+  candidate.racket_O = $("racketO").value;
+  const receiver = candidate.receiver || "unknown";
+  const server = candidate.server || "unknown";
+  $("guessText").textContent = `Selected server/receiver: ${server} serves from ${candidate.side || "unknown"}; ${receiver} receives (review selection)`;
+  const inTimeline = timeline.some(e=>e.kind==="candidate"&&e.candidate_n===candidate.candidate_n);
+  if (wasAccepted && !candidate.accepted) timeline = timeline.filter(e=>!(e.kind==="candidate"&&e.candidate_n===candidate.candidate_n));
+  else if (!wasAccepted && candidate.accepted && !inTimeline) insertByTime({kind:"candidate",candidate_n:candidate.candidate_n});
+  renderNav(); renderTimeline();
+}
+
+function useRacketCue() {
+  const candidate = candidateById(selectedId);
+  if (!candidate) return;
+  const r=candidate.racket_R, o=candidate.racket_O;
+  if (r==="up" && ["sideways","down"].includes(o)) $("server").value="O";
+  else if (o==="up" && ["sideways","down"].includes(r)) $("server").value="R";
+  else { setStatus("A clear cue needs one racket up and the other sideways or down.","error"); return; }
+  updateCandidate();
+  setStatus("Server set from racket orientation. Confirm the court side.","success");
+}
+
+function setStatus(message,kind="") { const node=$("saveStatus"); node.textContent=message; node.className=kind; }
+
+async function previewTimestamp() {
+  const time=Number($("manualTime").value);
+  if (!Number.isFinite(time) || time<=0) { setStatus("Enter a positive proxy timestamp first.","error"); return; }
+  const image=$("manualPreview");
+  image.src=`/api/frame?time=${encodeURIComponent(time)}&v=${Date.now()}`;
+  image.style.display="block";
+  setStatus("Loading timestamp preview…");
+  image.onload=()=>setStatus("Preview loaded. Times are relative to the trimmed proxy.","success");
+  image.onerror=()=>setStatus("Could not load a frame at that time.","error");
+}
+
+function addManualServe() {
+  const time=Number($("manualTime").value), server=$("manualServer").value, side=$("manualSide").value;
+  if (!Number.isFinite(time)||time<=0||time>state.video_duration_sec) { setStatus(`Timestamp must be between 0 and ${state.video_duration_sec.toFixed(2)} seconds.`,"error"); return; }
+  if (!server||!side) { setStatus("Choose the server and the server's court side.","error"); return; }
+  manualCounter++;
+  insertByTime({kind:"manual",id:`new-manual-${manualCounter}`,timestamp_sec:time,server,side});
+  renderTimeline(); setStatus("Missed serve added; score-before values recalculated.","success");
+}
+
+function addDummyPoint() {
+  const server=$("dummyServer").value, side=$("dummySide").value;
+  if (!server||!side) { setStatus("Choose the next server and that server's court side.","error"); return; }
+  dummyCounter++;
+  const entry={kind:"dummy",id:`new-dummy-${dummyCounter}`,timestamp_sec:0,server,side};
+  const after=Number($("dummyAfter").value||0);
+  timeline.splice(after,0,entry);
+  renderTimeline(); setStatus("Score-only dummy point added; downstream scores recalculated.","success");
+}
+
+async function saveReview() {
+  updateCandidate();
+  if ($("timelineWarning").hidden===false) { setStatus("Fix timeline order before saving.","error"); return; }
+  const payload={
+    candidates:candidates.map(c=>({candidate_n:c.candidate_n,accepted:c.accepted,server:c.server,side:c.side,racket_R:c.racket_R,racket_O:c.racket_O})),
+    timeline:timeline.map(e=>e.kind==="candidate"?{kind:e.kind,candidate_n:e.candidate_n,server:candidateById(e.candidate_n)?.server,side:candidateById(e.candidate_n)?.side}:{...e}),
+    initial_score:{R:Number($("initialR").value),O:Number($("initialO").value)},
+    final_point_winner:$("finalWinner").value||null,
+  };
+  setStatus("Saving…");
+  try {
+    const response=await fetch("/api/save",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const result=await response.json();
+    if (!response.ok) throw new Error(result.error||"save failed");
+    state.paths.reviewed_serves=result.reviewed_serves; state.paths.manual_review=result.manual_review;
+    setStatus(`Saved ${result.accepted_candidate_count} accepted candidates and ${result.point_count} score rows.`,"success");
+  } catch(error) { setStatus(error.message,"error"); }
+}
+
+async function init() {
+  try {
+    const response=await fetch("/api/state"); state=await response.json();
+    if (state.error) throw new Error(state.error);
+    candidates=state.candidates;
+    timeline=state.timeline;
+    $("videoLabel").textContent=`${state.video_name} · proxy duration ${state.video_duration_sec.toFixed(1)}s`;
+    $("initialR").value=state.initial_score.R;
+    $("initialO").value=state.initial_score.O;
+    $("finalWinner").value=state.final_point_winner||"";
+    for (const candidate of candidates) if (candidate.accepted) {
+      const present=timeline.some(e=>e.kind==="candidate"&&e.candidate_n===candidate.candidate_n);
+      if (!present) insertByTime({kind:"candidate",candidate_n:candidate.candidate_n});
+    }
+    selectedId=candidates[0]?.candidate_n??null;
+    renderNav(); renderCandidate(); renderTimeline();
+  } catch(error) { setStatus(error.message,"error"); }
+}
+
+$("accepted").onchange=updateCandidate;
+for (const id of ["server","side","racketR","racketO"]) $(id).onchange=updateCandidate;
+$("useRacket").onclick=useRacketCue;
+$("previousCandidate").onclick=()=>{const i=candidates.findIndex(c=>c.candidate_n===selectedId);if(i>0){selectedId=candidates[i-1].candidate_n;renderNav();renderCandidate();}};
+$("nextCandidate").onclick=()=>{const i=candidates.findIndex(c=>c.candidate_n===selectedId);if(i>=0&&i+1<candidates.length){selectedId=candidates[i+1].candidate_n;renderNav();renderCandidate();}};
+$("previewManual").onclick=previewTimestamp;
+$("addManual").onclick=addManualServe;
+$("addDummy").onclick=addDummyPoint;
+$("saveTop").onclick=saveReview;
+$("saveBottom").onclick=saveReview;
+$("initialR").oninput=renderTimeline;
+$("initialO").oninput=renderTimeline;
+$("finalWinner").onchange=renderTimeline;
+init();
+</script>
+</body>
+</html>

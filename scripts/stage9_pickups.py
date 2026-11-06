@@ -13,6 +13,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from shuttle_tracking import load_shuttle_tracks, samples_between, validate_shuttle_video
+
 
 COURT_WIDTH_M = 6.1
 COURT_LENGTH_M = 13.4
@@ -529,6 +531,86 @@ def analyze(
     return results, method
 
 
+def stationary_shuttle_candidate(
+    event: dict[str, Any], tracks: dict[str, Any], player_frames: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Find a stable raw point after the rally as a tentative resting-shuttle location."""
+    start = float(event["rally_end_sec"])
+    end = min(start + 4.0, float(event.get("next_serve_t") or start + 4.0) - 0.25)
+    fps = float(tracks["fps"])
+    samples = [
+        row for row in samples_between(tracks, start, end)
+        if row.get("visible") and row.get("court_region") == "inside"
+    ]
+    minimum_samples = max(5, math.ceil(0.2 * fps))
+    run: list[dict[str, Any]] = []
+    selected: list[dict[str, Any]] = []
+    for row in samples:
+        if run:
+            previous = run[-1]
+            close_in_time = float(row["t"]) - float(previous["t"]) <= 1.6 / fps
+            distance_from_start = math.hypot(
+                float(row["x_px"]) - float(run[0]["x_px"]),
+                float(row["y_px"]) - float(run[0]["y_px"]),
+            )
+            if not close_in_time or distance_from_start > 5.0:
+                if len(run) >= minimum_samples and float(run[-1]["t"]) - float(run[0]["t"]) >= 0.18:
+                    selected = run
+                    break
+                run = []
+        run.append(row)
+    if not selected and len(run) >= minimum_samples and float(run[-1]["t"]) - float(run[0]["t"]) >= 0.18:
+        selected = run
+    if not selected:
+        return {
+            "status": "no_stable_raw_point",
+            "method": "raw TrackNet point stable inside the court for at least 0.18 seconds after the rally",
+        }
+
+    x_px = float(np.median([float(row["x_px"]) for row in selected]))
+    y_px = float(np.median([float(row["y_px"]) for row in selected]))
+    first_t, last_t = float(selected[0]["t"]), float(selected[-1]["t"])
+    geometry = tracks.get("court_geometry") or {}
+    court_xy = None
+    side_hint = None
+    matrix_value = geometry.get("pixel_to_court")
+    if matrix_value is not None:
+        matrix = np.asarray(matrix_value, dtype=np.float64)
+        if matrix.shape == (3, 3) and np.isfinite(matrix).all():
+            point = np.asarray([[[x_px, y_px]]], dtype=np.float32)
+            projected = cv2.perspectiveTransform(point, matrix.astype(np.float32)).reshape(2)
+            if np.isfinite(projected).all():
+                court_x, court_y = float(projected[0]), float(projected[1])
+                court_size = geometry.get("court_size_m", {})
+                court_width = float(court_size.get("width", 6.1))
+                court_length = float(court_size.get("length", 13.4))
+                court_xy = [round(court_x, 3), round(court_y, 3)]
+                if 0 <= court_x <= court_width and 0 <= court_y <= court_length:
+                    local_rows = [
+                        row for row in player_frames
+                        if float(event["serve_t"]) <= float(row["t"]) <= float(event["rally_end_sec"])
+                    ]
+                    median_y = {}
+                    for player, key in (("R", "r"), ("O", "o")):
+                        values = [float(row[key][1]) for row in local_rows if isinstance(row.get(key), list) and len(row[key]) == 2]
+                        median_y[player] = float(np.median(values)) if values else None
+                    near = [player for player, value in median_y.items() if value is not None and value < 6.7]
+                    far = [player for player, value in median_y.items() if value is not None and value >= 6.7]
+                    if len(near) == 1 and len(far) == 1:
+                        side_hint = near[0] if court_y < 6.7 else far[0]
+
+    return {
+        "status": "tentative_resting_shuttle_candidate",
+        "method": "raw TrackNet point stable inside the calibrated court image polygon; verify the image before use",
+        "time_range_sec": [round(first_t, 3), round(last_t, 3)],
+        "point_px": [round(x_px, 2), round(y_px, 2)],
+        "projected_court_m": court_xy,
+        "landing_side_hint": side_hint,
+        "observations": len(selected),
+        "warning": "A stable image point is only a landing candidate; it may be a false or adjacent-court track.",
+    }
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Estimate shuttle landing side from post-rally player bends and review frames."
@@ -543,6 +625,7 @@ def main() -> int:
     parser.add_argument("--min-bend-duration", type=float, default=0.1, help="minimum sustained bend duration in seconds")
     parser.add_argument("--max-search-sec", type=float, default=12.0, help="maximum seconds after rally end to search")
     parser.add_argument("--next-serve-margin-sec", type=float, default=0.25, help="stop searching before next serve time")
+    parser.add_argument("--shuttle-tracks", type=Path, help="optional raw TrackNet tracks for tentative resting-shuttle landing locations")
     parser.add_argument("--overwrite", action="store_true", help="replace existing outputs")
     args = parser.parse_args()
 
@@ -551,10 +634,13 @@ def main() -> int:
     rallies_path = args.rallies_review_json.expanduser().resolve()
     output_path = args.output_json.expanduser().resolve()
     review_path = args.review_image.expanduser().resolve()
+    shuttle_path = args.shuttle_tracks.expanduser().resolve() if args.shuttle_tracks else None
     for path in (video_path, players_path, rallies_path):
         if not path.is_file():
             parser.error(f"input file does not exist: {path}")
-    if output_path == review_path or output_path in (video_path, players_path, rallies_path) or review_path in (video_path, players_path, rallies_path):
+    if shuttle_path is not None and not shuttle_path.is_file():
+        parser.error(f"TrackNet shuttle tracks do not exist: {shuttle_path}")
+    if output_path == review_path or output_path in (video_path, players_path, rallies_path, shuttle_path) or review_path in (video_path, players_path, rallies_path, shuttle_path):
         parser.error("input and output paths must be different")
     if not 0 < args.bend_ratio < 1 or args.slow_speed <= 0 or args.min_bend_duration <= 0:
         parser.error("bend ratio must be between 0 and 1; speed and bend duration must be positive")
@@ -578,6 +664,17 @@ def main() -> int:
             args.max_search_sec,
             args.next_serve_margin_sec,
         )
+        shuttle_data = load_shuttle_tracks(shuttle_path) if shuttle_path is not None else None
+        if shuttle_data is not None:
+            validate_shuttle_video(shuttle_data, video_path)
+            player_frames = json.loads(players_path.read_text(encoding="utf-8"))["frames"]
+            for event in results:
+                event["tracknet_landing_candidate"] = stationary_shuttle_candidate(
+                    event, shuttle_data, player_frames
+                )
+            method["tracknet_landing_candidate"] = (
+                "Optional tentative resting point from raw TrackNet observations. It is not treated as a confirmed landing or winner."
+            )
         write_review_sheet(video_path, json.loads(players_path.read_text(encoding="utf-8"))["frames"], times, results, review_path)
 
         side_counts = {"R": 0, "O": 0, "unknown": 0}
@@ -589,6 +686,7 @@ def main() -> int:
             "source_video": str(video_path),
             "source_players_json": str(players_path),
             "source_rallies_review_json": str(rallies_path),
+            "source_shuttle_tracks_json": shuttle_path.name if shuttle_path else None,
             "player_labels": {"R": "Stage 3 selected player (you)", "O": "opponent"},
             "method": method,
             "point_count": len(results),

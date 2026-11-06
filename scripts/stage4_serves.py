@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import sys
@@ -14,9 +15,20 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from shuttle_tracking import (
+    is_main_court_candidate,
+    load_shuttle_tracks,
+    point_box_distance,
+    samples_between,
+    validate_shuttle_video,
+)
+
 
 NET_Y_M = 6.7
 COURT_CENTER_X_M = 3.05
+MIN_SERVER_CUE_ADVANTAGE_M = 0.25
+DEFAULT_NEAR_STILL_SPEED_M_S = 0.7
+DEFAULT_FAR_STILL_SPEED_M_S = 0.9
 
 
 @dataclass
@@ -86,6 +98,8 @@ def position_speeds(
 def in_serve_area(
     positions: dict[str, tuple[float, float] | None],
     speeds: dict[str, float | None],
+    near_still_speed_m_s: float = DEFAULT_NEAR_STILL_SPEED_M_S,
+    far_still_speed_m_s: float = DEFAULT_FAR_STILL_SPEED_M_S,
 ) -> bool:
     present = [(player, point) for player, point in positions.items() if point is not None]
     if len(present) != 2 or any(speeds.get(player) is None for player, _ in present):
@@ -103,8 +117,8 @@ def in_serve_area(
         and 1.0 <= ry <= 4.9
         and 0.2 <= ox <= 5.9
         and 8.5 <= oy <= 12.4
-        and speeds[near_player] < 0.7
-        and speeds[far_player] < 0.9
+        and speeds[near_player] < near_still_speed_m_s
+        and speeds[far_player] < far_still_speed_m_s
     )
 
 
@@ -137,7 +151,7 @@ def guess_server_and_side(
         r_distance_to_net = abs(NET_Y_M - r_position[1])
         o_distance_to_net = abs(NET_Y_M - o_position[1])
         difference = abs(r_distance_to_net - o_distance_to_net)
-        if difference < 0.25:
+        if difference < MIN_SERVER_CUE_ADVANTAGE_M:
             continue
         votes.append("R" if r_distance_to_net < o_distance_to_net else "O")
 
@@ -235,9 +249,16 @@ def event_record(
         "end_t": round(timestamps[last.end_index], 3),
         "duration": round(timestamps[last.end_index] - timestamps[first.start_index], 3),
         "server": last.server,
+        "receiver": "O" if last.server == "R" else "R" if last.server == "O" else None,
         "side": last.side,
         "heuristic_agreement": round(weighted_confidence, 3) if weighted_confidence is not None else None,
-        "server_hint_method": "identity track closer to the net during the stationary service window; verify by eye",
+        "server_hint_method": "first-pass net-distance estimate; verify by eye",
+        "net_server_guess": last.server,
+        "net_heuristic_agreement": round(weighted_confidence, 3) if weighted_confidence is not None else None,
+        "net_vote_count": all_votes,
+        "centerline_server_guess": None,
+        "centerline_agreement": None,
+        "centerline_vote_count": 0,
         "position_server_guess": last.server,
         "position_side_guess": last.side,
         "r": median_position(player_positions["R"], review_start, review_end),
@@ -291,6 +312,64 @@ def side_from_position(server: str, position: list[float] | None) -> str | None:
     # A far-side player's right service court appears on camera-left.
     on_right = x < COURT_CENTER_X_M if is_far_player else x >= COURT_CENTER_X_M
     return "right" if on_right else "left"
+
+
+def refine_server_guesses_with_centerline(
+    events: list[dict[str, object]],
+    groups: list[list[ServeWindow]],
+    player_positions: dict[str, list[tuple[float, float] | None]],
+    minimum_confidence: float = 0.6,
+) -> None:
+    """Refine already-merged candidates using center-line proximity only."""
+    for event, windows in zip(events, groups):
+        votes: list[str] = []
+        for window in windows:
+            for index in range(window.start_index, window.end_index + 1):
+                r_position = player_positions["R"][index]
+                o_position = player_positions["O"][index]
+                if r_position is None or o_position is None:
+                    continue
+                r_offset = abs(r_position[0] - COURT_CENTER_X_M)
+                o_offset = abs(o_position[0] - COURT_CENTER_X_M)
+                difference = abs(r_offset - o_offset)
+                if difference < MIN_SERVER_CUE_ADVANTAGE_M:
+                    continue
+                votes.append("R" if r_offset < o_offset else "O")
+
+        if votes:
+            r_votes, o_votes = votes.count("R"), votes.count("O")
+            confidence = max(r_votes, o_votes) / len(votes)
+            centerline_guess = "R" if r_votes >= o_votes else "O"
+        else:
+            confidence = None
+            centerline_guess = None
+
+        event["centerline_server_guess"] = (
+            centerline_guess if confidence is not None and confidence >= minimum_confidence else None
+        )
+        event["centerline_agreement"] = round(confidence, 3) if confidence is not None else None
+        event["centerline_vote_count"] = len(votes)
+
+        if event["centerline_server_guess"] is None:
+            event["server_hint_method"] = (
+                "first-pass net-distance estimate retained; center-line second pass was inconclusive"
+            )
+            continue
+
+        refined_server = str(event["centerline_server_guess"])
+        refined_side = side_from_position(refined_server, event.get("r" if refined_server == "R" else "o"))
+        net_guess = event.get("net_server_guess")
+        if net_guess == refined_server:
+            method = "center-line second pass corroborated the first-pass net-distance estimate"
+        else:
+            method = "center-line second pass refined the first-pass net-distance estimate"
+        event["server"] = refined_server
+        event["receiver"] = "O" if refined_server == "R" else "R"
+        event["side"] = refined_side
+        event["heuristic_agreement"] = round(confidence, 3) if confidence is not None else None
+        event["position_server_guess"] = refined_server
+        event["position_side_guess"] = refined_side
+        event["server_hint_method"] = method
 
 
 def write_racket_review_template(review_dir: Path, events: list[dict[str, object]]) -> Path:
@@ -357,6 +436,7 @@ def apply_racket_orientation_review(
             side = side_from_position(server, event.get("r" if server == "R" else "o"))
             if side is not None:
                 event["server"] = server
+                event["receiver"] = "O" if server == "R" else "R"
                 event["side"] = side
                 event["server_hint_method"] = (
                     f"racket orientation review: {server} racket sideways/down, opponent racket up; "
@@ -637,6 +717,124 @@ def manual_score_review_draft(events: list[dict[str, object]]) -> dict[str, obje
     }
 
 
+def add_tracknet_server_cues(
+    events: list[dict[str, Any]], player_frames: list[dict[str, Any]], tracks: dict[str, Any]
+) -> None:
+    """Attach a low-confidence launch-origin hint without changing the server guess."""
+    times = [float(row["t"]) for row in player_frames]
+    width = int(tracks.get("frame_size_px", {}).get("width", 0))
+    height = int(tracks.get("frame_size_px", {}).get("height", 0))
+    if width <= 0 or height <= 0:
+        raise ValueError("shuttle tracks need positive frame_size_px dimensions")
+
+    for event in events:
+        anchor = float(event.get("end_t", event["t"]))
+        candidates = [
+            row for row in samples_between(tracks, anchor, anchor + 0.65)
+            if row.get("visible") and is_main_court_candidate(row)
+        ][:5]
+        if not candidates:
+            event["tracknet_serve_cue"] = {"status": "no_visible_main_court_track"}
+            continue
+
+        distances: dict[str, list[float]] = {"R": [], "O": []}
+        for row in candidates:
+            timestamp = float(row["t"])
+            frame_index = bisect.bisect_left(times, timestamp)
+            if frame_index >= len(times):
+                frame_index = len(times) - 1
+            if frame_index > 0 and timestamp - times[frame_index - 1] <= times[frame_index] - timestamp:
+                frame_index -= 1
+            player_frame = player_frames[frame_index]
+            x = float(row["x_px"]) / width
+            y = float(row["y_px"]) / height
+            for player, box_key in (("R", "rb"), ("O", "ob")):
+                distance = point_box_distance(x, y, player_frame.get(box_key))
+                if distance is not None:
+                    distances[player].append(distance)
+
+        median_distance = {
+            player: float(np.median(values)) if values else None
+            for player, values in distances.items()
+        }
+        available = [(value, player) for player, value in median_distance.items() if value is not None]
+        available.sort()
+        if len(available) == 2:
+            gap = available[1][0] - available[0][0]
+            if available[0][0] <= 0.16 and gap >= 0.05:
+                hint, status = available[0][1], "near_player_launch_hint"
+            else:
+                hint, status = None, "ambiguous_origin"
+        else:
+            gap = None
+            hint, status = None, "player_box_unavailable"
+        event["tracknet_serve_cue"] = {
+            "status": status,
+            "server_hint": hint,
+            "confidence": round(min(1.0, gap / 0.15), 3) if hint and gap is not None else None,
+            "confidence_basis": "normalized gap between the shuttle point's median distances to player boxes; heuristic score, not a calibrated probability",
+            "first_track_t": round(float(candidates[0]["t"]), 3),
+            "first_track_px": [round(float(candidates[0]["x_px"]), 1), round(float(candidates[0]["y_px"]), 1)],
+            "candidate_points": len(candidates),
+            "median_distance_to_player_boxes": {
+                player: round(value, 4) if value is not None else None
+                for player, value in median_distance.items()
+            },
+            "interpretation": "Image-space launch-origin cue; Stage 4 applies it only when explicitly enabled and confidence meets the configured threshold.",
+        }
+
+
+def refine_server_guesses_with_tracknet(
+    events: list[dict[str, Any]], minimum_confidence: float = 0.6
+) -> int:
+    """Apply confident TrackNet origin cues after the position and center-line passes."""
+    applied = 0
+    for event in events:
+        cue = event.get("tracknet_serve_cue")
+        hint = cue.get("server_hint") if isinstance(cue, dict) else None
+        confidence = cue.get("confidence") if isinstance(cue, dict) else None
+        old_server = event.get("server")
+        refinement: dict[str, Any] = {
+            "status": "no_confident_launch_hint",
+            "previous_server": old_server,
+            "minimum_confidence": minimum_confidence,
+        }
+        if hint not in ("R", "O") or not isinstance(confidence, (int, float)):
+            event["tracknet_server_refinement"] = refinement
+            continue
+        refinement["confidence"] = round(float(confidence), 3)
+        refinement["server_hint"] = hint
+        refinement["receiver_hint"] = "O" if hint == "R" else "R"
+        if float(confidence) < minimum_confidence:
+            refinement["status"] = "below_confidence_threshold"
+            event["tracknet_server_refinement"] = refinement
+            continue
+        position = event.get("r" if hint == "R" else "o")
+        side = side_from_position(hint, position)
+        if side is None:
+            refinement["status"] = "server_side_unavailable"
+            event["tracknet_server_refinement"] = refinement
+            continue
+
+        event["server"] = hint
+        event["receiver"] = "O" if hint == "R" else "R"
+        event["side"] = side
+        event["server_hint_method"] = (
+            f"TrackNet launch-origin second pass after center-line analysis; "
+            f"confidence {float(confidence):.2f} met threshold {minimum_confidence:.2f}; "
+            "side from server court position"
+        )
+        refinement.update({
+            "status": "applied",
+            "server": hint,
+            "receiver": event["receiver"],
+            "side": side,
+        })
+        event["tracknet_server_refinement"] = refinement
+        applied += 1
+    return applied
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Find serve-position windows and export serve candidates for manual review."
@@ -648,8 +846,32 @@ def main() -> int:
     parser.add_argument("--min-duration", type=float, default=0.8, help="minimum still window in seconds")
     parser.add_argument("--merge-gap", type=float, default=6.0, help="merge same server/side windows within seconds")
     parser.add_argument(
+        "--still-threshold", type=float,
+        help="shared maximum speed in m/s for near- and far-side players (overrides their defaults)",
+    )
+    parser.add_argument(
+        "--near-still-threshold", type=float,
+        help="near-side maximum speed in m/s (default: 0.7)",
+    )
+    parser.add_argument(
+        "--far-still-threshold", type=float,
+        help="far-side maximum speed in m/s (default: 0.9)",
+    )
+    parser.add_argument(
         "--racket-review-json", type=Path,
         help="optional JSON with reviewed R/O racket orientations (up, sideways, down, unclear)",
+    )
+    parser.add_argument(
+        "--shuttle-tracks", type=Path,
+        help="optional Stage 3A raw TrackNet tracks; enables a launch-origin cue",
+    )
+    parser.add_argument(
+        "--use-shuttle-server-cue", action="store_true",
+        help="after center-line analysis, refine server/receiver from a confident TrackNet launch-origin cue",
+    )
+    parser.add_argument(
+        "--shuttle-server-min-confidence", type=float, default=0.6,
+        help="minimum TrackNet server-cue heuristic score required for refinement (default: 0.6)",
     )
     parser.add_argument("--overwrite", action="store_true", help="replace existing outputs")
     review_mode = parser.add_mutually_exclusive_group()
@@ -666,29 +888,71 @@ def main() -> int:
     players_path = args.players_json.expanduser().resolve()
     output_json = args.output_json.expanduser().resolve()
     manual_review_json = output_json.parent / "manual_score_review.json"
+    reviewed_serves_json = output_json.parent / "serves_reviewed.json"
     review_dir = args.review_dir.expanduser().resolve()
     racket_review_json = args.racket_review_json.expanduser().resolve() if args.racket_review_json else None
+    shuttle_path = args.shuttle_tracks.expanduser().resolve() if args.shuttle_tracks else None
     if not video_path.is_file() or not players_path.is_file():
         parser.error("input video and players JSON must both exist")
     if racket_review_json is not None and not racket_review_json.is_file():
         parser.error(f"racket orientation review JSON does not exist: {racket_review_json}")
+    if shuttle_path is not None and not shuttle_path.is_file():
+        parser.error(f"TrackNet shuttle JSON does not exist: {shuttle_path}")
+    if args.use_shuttle_server_cue and shuttle_path is None:
+        parser.error("--use-shuttle-server-cue requires --shuttle-tracks")
+    if not 0.0 <= args.shuttle_server_min_confidence <= 1.0:
+        parser.error("--shuttle-server-min-confidence must be between 0 and 1")
     if args.min_duration <= 0 or args.merge_gap < 0:
         parser.error("minimum duration must be positive and merge gap must be zero or greater")
+    if args.still_threshold is not None and args.still_threshold <= 0:
+        parser.error("still threshold must be greater than zero")
+    if args.near_still_threshold is not None and args.near_still_threshold <= 0:
+        parser.error("near still threshold must be greater than zero")
+    if args.far_still_threshold is not None and args.far_still_threshold <= 0:
+        parser.error("far still threshold must be greater than zero")
+    if args.still_threshold is not None and (
+        args.near_still_threshold is not None or args.far_still_threshold is not None
+    ):
+        parser.error("use --still-threshold or the separate near/far thresholds, not both")
+    if args.still_threshold is not None:
+        near_still_speed_m_s = far_still_speed_m_s = args.still_threshold
+    else:
+        near_still_speed_m_s = (
+            DEFAULT_NEAR_STILL_SPEED_M_S
+            if args.near_still_threshold is None else args.near_still_threshold
+        )
+        far_still_speed_m_s = (
+            DEFAULT_FAR_STILL_SPEED_M_S
+            if args.far_still_threshold is None else args.far_still_threshold
+        )
     if output_json in (video_path, players_path) or manual_review_json in (video_path, players_path, output_json):
         parser.error("input and output paths must be different")
-    if review_dir in (video_path, players_path, output_json, manual_review_json):
+    if reviewed_serves_json in (video_path, players_path, output_json, manual_review_json):
+        parser.error("generated output paths must be different from inputs and each other")
+    if review_dir in (video_path, players_path, output_json, manual_review_json, reviewed_serves_json):
         parser.error("input and output paths must be different")
-    if racket_review_json in (video_path, players_path, output_json, manual_review_json):
+    if racket_review_json is not None and racket_review_json in (
+        video_path, players_path, output_json, manual_review_json, reviewed_serves_json, shuttle_path
+    ):
         parser.error("racket review JSON must be separate from all inputs and generated outputs")
+    if shuttle_path is not None and shuttle_path in (
+        video_path, players_path, output_json, manual_review_json, reviewed_serves_json, racket_review_json
+    ):
+        parser.error("TrackNet JSON must be separate from all outputs and other inputs")
     if racket_review_json == review_dir / "racket_orientation_review.template.json":
         parser.error("copy the generated template to a separate JSON file before editing it")
-    existing_outputs = [path for path in (output_json, manual_review_json) if path.exists()]
+    existing_outputs = [
+        path for path in (output_json, manual_review_json, reviewed_serves_json) if path.exists()
+    ]
     if existing_outputs and not args.overwrite:
         parser.error(
             "output already exists: " + ", ".join(str(path) for path in existing_outputs) + "; pass --overwrite"
         )
     if review_dir.exists() and not args.overwrite:
         parser.error(f"review directory already exists: {review_dir} (pass --overwrite)")
+    if args.overwrite:
+        # A new candidate list invalidates the previous UI decisions.
+        reviewed_serves_json.unlink(missing_ok=True)
 
     data = json.loads(players_path.read_text(encoding="utf-8"))
     frames = data.get("frames", [])
@@ -719,6 +983,8 @@ def main() -> int:
         in_serve_area(
             {player: player_positions[player][i] for player in ("R", "O")},
             {player: player_speeds[player][i] for player in ("R", "O")},
+            near_still_speed_m_s,
+            far_still_speed_m_s,
         )
         for i in range(len(frames))
     ]
@@ -733,6 +999,20 @@ def main() -> int:
         event_record(i + 1, group, timestamps, player_positions)
         for i, group in enumerate(groups)
     ]
+    refine_server_guesses_with_centerline(events, groups, player_positions)
+    shuttle_data = load_shuttle_tracks(shuttle_path) if shuttle_path is not None else None
+    if shuttle_data is not None:
+        validate_shuttle_video(shuttle_data, video_path)
+        add_tracknet_server_cues(events, frames, shuttle_data)
+        print(f"TrackNet server-origin cues attached: {sum(bool(e.get('tracknet_serve_cue', {}).get('server_hint')) for e in events)}/{len(events)}.")
+        if args.use_shuttle_server_cue:
+            refined = refine_server_guesses_with_tracknet(
+                events, minimum_confidence=args.shuttle_server_min_confidence
+            )
+            print(
+                f"TrackNet refined server/receiver after center-line pass: {refined}/{len(events)} "
+                f"(minimum confidence {args.shuttle_server_min_confidence:.2f})."
+            )
     racket_overrides = apply_racket_orientation_review(events, racket_review_json)
     if racket_review_json is not None:
         review_records = [
@@ -788,6 +1068,11 @@ def main() -> int:
             json.dump({"reviewed_interactively": False, "decisions": []}, file, indent=2)
             file.write("\n")
 
+    for event in events:
+        event["receiver"] = (
+            "O" if event.get("server") == "R" else "R" if event.get("server") == "O" else None
+        )
+
     clean_events = [
         {key: value for key, value in event.items() if not key.startswith("_")}
         for event in events
@@ -798,14 +1083,22 @@ def main() -> int:
     ]
     payload = {
         "fps": fps,
+        "still_speed_threshold_m_s": {
+            "near": near_still_speed_m_s,
+            "far": far_still_speed_m_s,
+        },
         "source": str(players_path),
         "player_labels": {"R": "Stage 3 identity selection", "O": "opponent"},
         "player_identity": data.get("player_identity", {}),
         "side_convention": "right/left from the server's own perspective; the far player's right is camera-left",
         "server_guess_method": (
+            "stationary candidates are generated and merged using the existing position-area, speed, duration, and net-distance flow; "
+            "a separate center-line pass refines server/receiver labels after candidates are fixed; "
+            "when --use-shuttle-server-cue is set, a confident TrackNet launch-origin cue refines labels after the center-line pass; "
             "user-reviewed racket orientation from --racket-review-json overrides the position heuristic "
-            "when there is a clear up vs sideways/down contrast; guesses require review"
+            "when there is a clear up vs sideways/down contrast; final guesses still require review"
         ),
+        "tracknet_source": shuttle_path.name if shuttle_path else None,
         "reviewed_interactively": bool(interactive_review),
         "events": clean_events,
         "rejected_candidates": clean_rejected,
@@ -830,7 +1123,11 @@ def main() -> int:
     print(f"Stage 5 manual score review draft: {manual_review_json}")
     print(f"Review sheets: {page_count} page(s) in {review_dir}")
     print(f"Racket orientation template: {template_path}")
-    print(f"Smoothing window: {smoothing_window} frames; still threshold: {args.min_duration:.1f}s.")
+    print(
+        f"Smoothing window: {smoothing_window} frames; still speed thresholds: "
+        f"near < {near_still_speed_m_s:.2f} m/s, far < {far_still_speed_m_s:.2f} m/s; "
+        f"minimum still window: {args.min_duration:.1f}s."
+    )
     print(f"Elapsed: {elapsed:.1f}s.")
     return 0
 

@@ -19,10 +19,19 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def coach_evidence(report: dict[str, Any]) -> dict[str, Any]:
+def coach_evidence(report: dict[str, Any], player_code: str | None = None) -> dict[str, Any]:
     names = report.get("player_names", {})
-    player_name = str(names.get("R") or "Player R")
-    opponent_name = str(names.get("O") or "Player O")
+    report_player_code = report.get("analysis_subject_code", "R")
+    player_code = player_code or report_player_code
+    if player_code not in ("R", "O"):
+        raise ValueError("analysis player code must be R or O")
+    if player_code != report_player_code:
+        raise ValueError(
+            f"report_data.json is prepared for {report_player_code}; rerun Stage 10 with --player-code {player_code}"
+        )
+    opponent_code = "O" if player_code == "R" else "R"
+    player_name = str(names.get(player_code) or f"Player {player_code}")
+    opponent_name = str(names.get(opponent_code) or f"Player {opponent_code}")
 
     def name_for(code: Any) -> str | None:
         return player_name if code == "R" else opponent_name if code == "O" else None
@@ -31,36 +40,45 @@ def coach_evidence(report: dict[str, Any]) -> dict[str, Any]:
     score_analysis = report.get("score_analysis", {})
     heatmap = report.get("heatmap_timelapse", {})
     identity = report.get("player_identity", {})
-    player_role = identity.get("R", "player selected in Stage 3")
-    opponent_role = identity.get("O", "opponent")
+    player_role = identity.get(player_code, "player selected in Stage 3" if player_code == "R" else "other player")
+    opponent_role = identity.get(opponent_code, "opponent")
     video_points = report.get("video_points", [])
     score_curve = []
     for row in score_analysis.get("curve", []):
         score_curve.append({
             "score_point": row.get("point_n"),
             "serve": row.get("video_serve_number"),
-            "score": {player_name: row.get("R"), opponent_name: row.get("O")},
+            "score": {player_name: row.get(player_code), opponent_name: row.get(opponent_code)},
             "winner": name_for(row.get("winner")),
             "score_only_point": bool(row.get("dummy_point")),
         })
 
     rally_length = {}
     for key, value in report.get("by_rally_length", {}).items():
+        player_wins = value.get("player_wins", value.get(f"{player_code}_wins"))
+        if player_wins is None and player_code == "O":
+            player_wins = max(0, int(value.get("rally_count", 0)) - int(value.get("R_wins", 0)))
+        player_losses = value.get("player_losses", value.get(f"{player_code}_losses"))
+        if player_losses is None and player_code == "O":
+            player_losses = max(0, int(value.get("rally_count", 0)) - int(value.get("O_wins", player_wins or 0)))
+        player_rate = value.get("player_win_rate_pct", value.get(f"{player_code}_win_rate_pct"))
+        if player_rate is None and player_code == "O":
+            player_rate = value.get("O_win_rate_pct")
         rally_length[key] = {
             "duration_band": value.get("label"),
             "rallies": value.get("rally_count"),
-            "player_wins": value.get("R_wins"),
-            "player_losses": value.get("R_losses"),
-            "player_win_rate_pct": value.get("R_win_rate_pct"),
+            "player_wins": player_wins,
+            "player_losses": player_losses,
+            "player_win_rate_pct": player_rate,
             "mean_rally_duration_sec": value.get("mean_rally_duration_sec"),
-            "player_movement": value.get("movement", {}).get("R", {}),
-            "opponent_movement": value.get("movement", {}).get("O", {}),
+            "player_movement": value.get("movement", {}).get(player_code, {}),
+            "opponent_movement": value.get("movement", {}).get(opponent_code, {}),
         }
 
     phases = []
     for phase in heatmap.get("phases", []):
         phase_players = {}
-        for code, role, name in (("R", "player", player_name), ("O", "opponent", opponent_name)):
+        for code, role, name in ((player_code, "player", player_name), (opponent_code, "opponent", opponent_name)):
             summary = phase.get("players", {}).get(code, {})
             phase_players[role] = {
                 "name": name,
@@ -84,7 +102,20 @@ def coach_evidence(report: dict[str, Any]) -> dict[str, Any]:
             "serve_time_sec": row.get("serve_t"),
             "estimated_rally_duration_sec": row.get("rally_duration_sec"),
             "rally_end_confidence": row.get("rally_end_confidence"),
-            "player_distance_m": row.get("R_distance_m"),
+            "rally_end_method": row.get("rally_end_method"),
+            "movement_rally_end_sec": row.get("movement_rally_end_sec"),
+            "tracknet_rally_end_refinement": row.get("tracknet_rally_end_refinement"),
+            "tracknet_shuttle_evidence": row.get("tracknet_shuttle_evidence"),
+            "tracknet_landing_candidate": row.get("tracknet_landing_candidate"),
+            "estimated_shot_count": row.get("estimated_shot_count"),
+            "manual_shot_count": row.get("manual_shot_count"),
+            "shot_count": row.get("shot_count"),
+            "shot_count_source": row.get("shot_count_source"),
+            "shot_count_quality": row.get("shot_count_quality"),
+            "player_beginning_speed_m_s": row.get("movement_phase_speed", {}).get(player_code, {}).get("beginning_average_speed_m_s"),
+            "player_tail_speed_m_s": row.get("movement_phase_speed", {}).get(player_code, {}).get("tail_average_speed_m_s"),
+            "player_tail_speed_change_pct": row.get("movement_phase_speed", {}).get(player_code, {}).get("tail_change_pct"),
+            "player_distance_m": row.get("player_distance_m", row.get(f"{player_code}_distance_m")),
             "stage10_observation": row.get("coach_note"),
             "contact_sheets": row.get("contact_sheets", []),
         })
@@ -95,11 +126,12 @@ def coach_evidence(report: dict[str, Any]) -> dict[str, Any]:
         by_outcome[outcome] = {
             "rallies": group.get("rally_count"),
             "mean_duration_sec": group.get("mean_rally_duration_sec"),
-            "player_movement": group.get("players", {}).get("R", {}),
-            "opponent_movement": group.get("players", {}).get("O", {}),
+            "player_movement": group.get("players", {}).get(player_code, {}),
+            "opponent_movement": group.get("players", {}).get(opponent_code, {}),
         }
 
     return {
+        "analysis_subject_code": player_code,
         "participants": {
             "player": {"name": player_name, "role": player_role},
             "opponent": {"name": opponent_name, "role": opponent_role},
@@ -107,12 +139,12 @@ def coach_evidence(report: dict[str, Any]) -> dict[str, Any]:
         },
         "match_result": {
             "final_score": {
-                player_name: (score.get("final") or {}).get("R"),
-                opponent_name: (score.get("final") or {}).get("O"),
+                player_name: (score.get("final") or {}).get(player_code),
+                opponent_name: (score.get("final") or {}).get(opponent_code),
             },
             "video_rallies": score.get("video_rally_count"),
-            "player_video_wins": score.get("R_video_rally_wins"),
-            "player_video_losses": score.get("R_video_rally_losses"),
+            "player_video_wins": score.get("player_video_rally_wins", score.get(f"{player_code}_video_rally_wins")),
+            "player_video_losses": score.get("player_video_rally_losses", score.get(f"{player_code}_video_rally_losses")),
             "score_only_points": score.get("score_only_dummy_point_numbers", []),
         },
         "score_progression": {
@@ -121,25 +153,28 @@ def coach_evidence(report: dict[str, Any]) -> dict[str, Any]:
         },
         "rally_length_comparison": rally_length,
         "movement_by_outcome": by_outcome,
+        "rally_effort_analysis": report.get("rally_effort_analysis", {}),
         "court_heatmap_phases": phases,
         "heatmap_observations": heatmap.get("coaching_commentary", []),
         "heatmap_timing_note": heatmap.get("timing_note"),
         "ready_position_pose": report.get("pose_ready_by_outcome", {}),
         "pickup_evidence": {
             "landing_side_counts": {
-                player_name: report.get("pickup_evidence", {}).get("landing_side_counts", {}).get("R", 0),
-                opponent_name: report.get("pickup_evidence", {}).get("landing_side_counts", {}).get("O", 0),
+                player_name: report.get("pickup_evidence", {}).get("landing_side_counts", {}).get(player_code, 0),
+                opponent_name: report.get("pickup_evidence", {}).get("landing_side_counts", {}).get(opponent_code, 0),
                 "unknown": report.get("pickup_evidence", {}).get("landing_side_counts", {}).get("unknown", 0),
             },
             "interpretation_note": report.get("pickup_evidence", {}).get("interpretation_note"),
         },
+        "tracknet_shuttle_analysis": report.get("tracknet_shuttle_analysis", {"enabled": False}),
         "three_video_reviews": reviews,
         "data_quality_notes": report.get("quality_notes", {}),
     }
 
 
-def build_context(report: dict[str, Any]) -> str:
-    evidence = coach_evidence(report)
+def build_context(report: dict[str, Any], player_code: str | None = None) -> str:
+    evidence = coach_evidence(report, player_code)
+    player_code = evidence["analysis_subject_code"]
     serves = [row.get("serve") for row in evidence["three_video_reviews"] if row.get("serve") is not None]
     headings = [
         "## Match opening",
@@ -154,7 +189,7 @@ def build_context(report: dict[str, Any]) -> str:
         "",
         f"Act as an experienced badminton singles coach reviewing this match. The player is {evidence['participants']['player']['name']} ({evidence['participants']['player']['role']}); the opponent is {evidence['participants']['opponent']['name']} ({evidence['participants']['opponent']['role']}). Write a specific, natural coaching readout that sounds like a coach speaking to {evidence['participants']['player']['name']}, not a statistics report.",
         "",
-        f"Use only the supplied evidence. Refer to the two players by name ({evidence['participants']['player']['name']} and {evidence['participants']['opponent']['name']}); do not use tracking codes such as R or O in the narrative. Treat movement, pose, pickup, and rally-end estimates as clues rather than proof of cause. Do not invent shots or events that are not in the data. Use timestamps and serve numbers to point the player to video they can check. The score-only point is not a video serve or rally. Avoid explaining basic badminton scoring rules.",
+        f"Use only the supplied evidence. Refer to the two players by name ({evidence['participants']['player']['name']} and {evidence['participants']['opponent']['name']}); do not use tracking codes such as R or O in the narrative. Treat movement, pose, pickup, rally-end, TrackNet shot-count, and shuttle estimates as clues rather than proof of cause. A TrackNet stationary-point candidate is not a confirmed landing or winner. Shot counts are estimates; image-space net-plane candidates can include projection overlap or adjacent-court tracks and should be checked against video. A lower tail speed is not proof of fatigue. Do not infer true shuttle speed or exact shot type from image coordinates. Do not invent shots or events that are not in the data. Use timestamps and serve numbers to point the player to video they can check. The score-only point is not a video serve or rally. Avoid explaining basic badminton scoring rules.",
         "",
         "Keep the opening and each analysis section to one or two concise spoken sentences. For each reviewed serve, explain what to look for in that clip and give one practical adjustment. Finish with two or three prioritized practice focuses. Do not repeat the JSON or add generic praise.",
         "",
@@ -164,7 +199,7 @@ def build_context(report: dict[str, Any]) -> str:
         json.dumps(evidence, ensure_ascii=False, indent=2),
         "```",
         "",
-        "Return only the coaching narrative as Markdown. Use these exact headings, including one for each reviewed serve:",
+        f"Return only the coaching narrative as Markdown. Start with this exact metadata line: `<!-- analysis_subject_code: {player_code} -->`. Use these exact headings, including one for each reviewed serve:",
         output_rules,
         "",
     ])
@@ -201,6 +236,7 @@ def ask_ollama(endpoint: str, model: str, prompt: str, timeout: float) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create AI coach context or generate a narrative with local Ollama.")
     parser.add_argument("report_json", type=Path, help="Stage 10 report_data.json")
+    parser.add_argument("--player-code", choices=("R", "O"), help="verify the Stage 10 analysis subject")
     parser.add_argument("--mode", choices=("context", "ollama"), default="context", help="export a copy/paste prompt or call local Ollama")
     parser.add_argument("--context-output", type=Path, help="self-contained prompt and evidence file (defaults beside report_json)")
     parser.add_argument("--narrative-output", type=Path, help="Markdown narrative consumed by Stage 11 (defaults beside report_json)")
@@ -215,9 +251,17 @@ def main() -> int:
             raise ValueError("--timeout must be greater than zero")
         report_path = args.report_json.expanduser().resolve()
         report = read_json(report_path)
-        context = build_context(report)
-        context_output = (args.context_output or report_path.parent / "AI-coach-context.md").expanduser()
-        narrative_output = (args.narrative_output or report_path.parent / "AI-coach-narrative.md").expanduser()
+        subject_code = args.player_code or report.get("analysis_subject_code", "R")
+        if subject_code not in ("R", "O"):
+            raise ValueError("report analysis_subject_code must be R or O")
+        context = build_context(report, subject_code)
+        suffix = "" if subject_code == "R" else "-O"
+        context_output = (
+            args.context_output or report_path.parent / f"AI-coach-context{suffix}.md"
+        ).expanduser()
+        narrative_output = (
+            args.narrative_output or report_path.parent / f"AI-coach-narrative{suffix}.md"
+        ).expanduser()
         context_output.parent.mkdir(parents=True, exist_ok=True)
         narrative_output.parent.mkdir(parents=True, exist_ok=True)
         outputs = [context_output]

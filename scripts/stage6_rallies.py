@@ -16,6 +16,13 @@ from typing import Any
 import cv2
 import numpy as np
 
+from shuttle_tracking import (
+    load_shuttle_tracks,
+    samples_between,
+    summarize_window,
+    validate_shuttle_video,
+)
+
 
 TILE_WIDTH = 320
 TILE_HEIGHT = 180
@@ -214,6 +221,113 @@ def estimate_rally_ends(
         point["rally_duration_sec"] = round(end - start, 3)
 
 
+def add_shuttle_evidence(points: list[dict[str, Any]], tracks: dict[str, Any]) -> None:
+    """Attach raw-track coverage and a terminal-time comparison to each review row."""
+    for point in points:
+        start = point.get("serve_t")
+        end = point.get("rally_end_sec")
+        if not isinstance(start, (int, float)):
+            point["tracknet_shuttle_evidence"] = {"status": "serve_time_unavailable"}
+            continue
+        interval_end = float(end) if isinstance(end, (int, float)) else float(point.get("review_end_t", start))
+        summary = summarize_window(tracks, float(start), interval_end)
+        last_t = summary.get("last_main_court_t")
+        delta = round(float(last_t) - float(end), 3) if last_t is not None and isinstance(end, (int, float)) else None
+        summary.update({
+            "status": "raw_track_summary",
+            "rally_end_delta_sec": delta,
+            "supports_player_pause_estimate": abs(delta) <= 1.0 if delta is not None else None,
+            "note": "Raw TrackNet observations are supporting evidence; gaps and adjacent-court selections can make the last point early or wrong.",
+        })
+        point["tracknet_shuttle_evidence"] = summary
+
+
+def refine_rally_ends_with_shuttle(
+    points: list[dict[str, Any]],
+    tracks: dict[str, Any],
+    search_before_sec: float = 1.5,
+    search_after_sec: float = 0.35,
+    min_samples: int = 3,
+) -> tuple[int, int]:
+    """Refine movement ends with a sustained main-court TrackNet cluster near the pause."""
+    applied = 0
+    fallback = 0
+    fps = float(tracks["fps"])
+    maximum_gap = max(0.20, 2.5 / fps)
+    last_track_time = float(tracks["frames"][-1]["t"]) if tracks["frames"] else 0.0
+
+    for point in points:
+        movement_end = point.get("rally_end_sec")
+        start = point.get("serve_t")
+        if not isinstance(movement_end, (int, float)) or not isinstance(start, (int, float)):
+            point["tracknet_rally_end_refinement"] = {"status": "movement_estimate_unavailable"}
+            fallback += 1
+            continue
+
+        next_serve = point.get("next_serve_t")
+        lower = max(float(start) + 0.8, float(movement_end) - search_before_sec)
+        upper = min(
+            float(movement_end) + search_after_sec,
+            float(next_serve) - 0.2 if isinstance(next_serve, (int, float)) else last_track_time,
+            last_track_time,
+        )
+        rows = [
+            row for row in samples_between(tracks, lower, upper)
+            if row.get("visible") and row.get("court_region") in ("inside", "near_boundary")
+        ]
+
+        clusters: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for row in rows:
+            if current and float(row["t"]) - float(current[-1]["t"]) > maximum_gap:
+                clusters.append(current)
+                current = []
+            current.append(row)
+        if current:
+            clusters.append(current)
+        clusters = [
+            cluster for cluster in clusters
+            if len(cluster) >= min_samples
+            and float(cluster[-1]["t"]) - float(cluster[0]["t"]) >= 0.05
+        ]
+
+        if not clusters:
+            point["tracknet_rally_end_refinement"] = {
+                "status": "insufficient_sustained_main_court_track_near_movement_end",
+                "movement_end_sec": round(float(movement_end), 3),
+                "search_window_sec": [round(lower, 3), round(upper, 3)],
+                "fallback": "movement estimate retained",
+            }
+            fallback += 1
+            continue
+
+        cluster = min(
+            clusters,
+            key=lambda items: abs(float(np.median([float(row["t"]) for row in items])) - float(movement_end)),
+        )
+        selected = min(cluster, key=lambda row: abs(float(row["t"]) - float(movement_end)))
+        tracknet_end = float(selected["t"])
+        previous_end = float(movement_end)
+        point["movement_rally_end_sec"] = round(previous_end, 3)
+        point["rally_end_sec"] = round(tracknet_end, 3)
+        point["rally_duration_sec"] = round(tracknet_end - float(start), 3)
+        point["rally_end_method"] = "tracknet_cluster_near_movement_pause"
+        point["rally_end_confidence"] = "medium" if len(cluster) >= 5 else "low"
+        point["rally_end_estimated"] = True
+        point["tracknet_rally_end_refinement"] = {
+            "status": "applied",
+            "movement_end_sec": round(previous_end, 3),
+            "tracknet_end_sec": round(tracknet_end, 3),
+            "delta_from_movement_sec": round(tracknet_end - previous_end, 3),
+            "cluster_samples": len(cluster),
+            "cluster_span_sec": round(float(cluster[-1]["t"]) - float(cluster[0]["t"]), 3),
+            "method": "nearest raw TrackNet observation in a sustained calibrated main-court cluster near the movement pause",
+        }
+        applied += 1
+
+    return applied, fallback
+
+
 def load_video_points(path: Path) -> list[dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     points = data.get("points")
@@ -351,10 +465,18 @@ def write_index(review_dir: Path, points: list[dict[str, Any]]) -> Path:
             f" | rally ends ~{point['rally_end_sec']:.1f}s"
             if point.get("rally_end_estimated") else ""
         )
+        if point.get("rally_end_method") == "tracknet_cluster_near_movement_pause":
+            end_label += " (TrackNet refined)"
+        shuttle = point.get("tracknet_shuttle_evidence") or {}
+        shuttle_label = (
+            f" | TrackNet {shuttle['main_court_candidate_count']} court samples; "
+            f"last {shuttle['last_main_court_t']:.1f}s"
+            if isinstance(shuttle.get("last_main_court_t"), (int, float)) else ""
+        )
         title = (
             f"s{point['point_n']:02d} | candidate {point['candidate_n']} | "
             f"{point['server']} {time_label} | "
-            f"{point['score_before']} → {point['score_after']}{end_label}"
+            f"{point['score_before']} → {point['score_after']}{end_label}{shuttle_label}"
         )
         sections.append(
             f"<details><summary>{escape(title)}</summary>"
@@ -401,6 +523,22 @@ def main() -> int:
         "--active-speed-m-s", type=float, default=1.0,
         help="speed that counts as an active moment in m/s (default: 1.0)",
     )
+    parser.add_argument(
+        "--shuttle-tracks", type=Path,
+        help="optional Stage 3A raw TrackNet tracks; attach coverage and rally-end comparison",
+    )
+    parser.add_argument(
+        "--rally-end-source", choices=("players", "shuttle"), default="players",
+        help="use player pauses (default), or refine them with a sustained TrackNet cluster near the pause",
+    )
+    parser.add_argument(
+        "--shuttle-rally-window-sec", type=float, default=1.5,
+        help="seconds before the player pause to search for a TrackNet cluster (default: 1.5)",
+    )
+    parser.add_argument(
+        "--shuttle-rally-after-sec", type=float, default=0.35,
+        help="maximum seconds after the player pause to accept TrackNet points (default: 0.35)",
+    )
     parser.add_argument("--overwrite", action="store_true", help="replace existing review outputs")
     args = parser.parse_args()
 
@@ -409,10 +547,17 @@ def main() -> int:
     review_dir = args.review_dir.expanduser().resolve()
     output_path = args.output_json.expanduser().resolve()
     players_path = args.estimate_rally_ends.expanduser().resolve() if args.estimate_rally_ends else None
+    shuttle_path = args.shuttle_tracks.expanduser().resolve() if args.shuttle_tracks else None
     if not video_path.is_file() or not points_path.is_file():
         parser.error("input video and points JSON must both exist")
     if players_path is not None and not players_path.is_file():
         parser.error(f"player tracks do not exist: {players_path}")
+    if shuttle_path is not None and not shuttle_path.is_file():
+        parser.error(f"TrackNet shuttle tracks do not exist: {shuttle_path}")
+    if args.rally_end_source == "shuttle" and (shuttle_path is None or players_path is None):
+        parser.error("--rally-end-source shuttle requires --shuttle-tracks and --estimate-rally-ends")
+    if args.shuttle_rally_window_sec <= 0 or args.shuttle_rally_after_sec < 0:
+        parser.error("TrackNet rally search window must be positive and the after-pause allowance cannot be negative")
     if args.interval_sec <= 0:
         parser.error("frame interval must be positive")
     if args.pause_duration_sec <= 0 or args.pause_speed_m_s < 0 or args.active_speed_m_s <= 0:
@@ -421,6 +566,8 @@ def main() -> int:
         parser.error("input and output paths must be different")
     if players_path is not None and (players_path in (output_path, review_dir) or players_path == video_path):
         parser.error("player-track input and review outputs must be different")
+    if shuttle_path is not None and shuttle_path in (output_path, review_dir, video_path, points_path, players_path):
+        parser.error("TrackNet input and Stage 6 outputs must be different")
     if output_path.exists() and not args.overwrite:
         parser.error(f"output already exists: {output_path} (pass --overwrite)")
     if review_dir.exists() and not args.overwrite:
@@ -542,6 +689,11 @@ def main() -> int:
     cap.release()
 
     end_estimation = None
+    shuttle_data = load_shuttle_tracks(shuttle_path) if shuttle_path is not None else None
+    if shuttle_data is not None:
+        validate_shuttle_video(shuttle_data, video_path)
+        if args.rally_end_source == "shuttle" and not shuttle_data.get("court_geometry"):
+            parser.error("TrackNet rally-end selection requires Stage 3A --calibration-json court tags")
     estimated_serve_times = 0
     if players_path is not None:
         estimate_missing_serve_times(review_points)
@@ -557,6 +709,14 @@ def main() -> int:
             active_speed_m_s=args.active_speed_m_s,
             pause_duration_sec=args.pause_duration_sec,
         )
+        shuttle_refined = shuttle_fallback = 0
+        if args.rally_end_source == "shuttle" and shuttle_data is not None:
+            shuttle_refined, shuttle_fallback = refine_rally_ends_with_shuttle(
+                review_points,
+                shuttle_data,
+                search_before_sec=args.shuttle_rally_window_sec,
+                search_after_sec=args.shuttle_rally_after_sec,
+            )
         for gap in unresolved_gaps:
             gap["resolved_by_estimated_timestamps"] = all(
                 point.get("serve_t") is not None
@@ -573,7 +733,12 @@ def main() -> int:
             if point["point_n"] in estimated_n:
                 point["review_scope"] = "shared contact sheet; serve time interpolated; rally end estimated"
         end_estimation = {
-            "method": "smoothed Stage 3 player-track speed; first sustained low-motion window after active movement",
+            "method": (
+                "Stage 3 player pause refined by a sustained raw TrackNet main-court cluster near that pause"
+                if args.rally_end_source == "shuttle" else
+                "smoothed Stage 3 player-track speed; first sustained low-motion window after active movement"
+            ),
+            "rally_end_source": args.rally_end_source,
             "missing_serve_method": "equal spacing inside the bounded shared interval",
             "source_players_json": players_path.name,
             "smoothing_window_sec": 0.7,
@@ -584,6 +749,20 @@ def main() -> int:
             "estimates_are_approximate": True,
         }
 
+    if shuttle_data is not None:
+        add_shuttle_evidence(review_points, shuttle_data)
+        if end_estimation is not None:
+            end_estimation["tracknet_evidence"] = (
+                "sustained calibrated main-court TrackNet clusters can refine the movement pause; "
+                "points without enough nearby shuttle observations retain the player estimate"
+                if args.rally_end_source == "shuttle" else
+                "raw track coverage and proximity to the pause estimate are recorded per point; "
+                "TrackNet does not change rally_end_sec in the default players mode"
+            )
+            if args.rally_end_source == "shuttle":
+                end_estimation["tracknet_rally_end_refinements_applied"] = shuttle_refined
+                end_estimation["tracknet_rally_end_fallbacks"] = shuttle_fallback
+
     index_path = write_index(review_dir, review_points)
 
     payload = {
@@ -592,18 +771,26 @@ def main() -> int:
         "video_duration_sec": round(video_duration, 3),
         "sample_interval_sec": args.interval_sec,
         "method": (
-            "picture-only contact sheets plus player-track timing estimates; no audio used"
+            "picture-only contact sheets plus player-track timing estimates with optional TrackNet refinement; no audio used"
             if end_estimation else "picture-only review; no audio used"
         ),
         "dummy_points_skipped": True,
         "review_instructions": (
-            "Rally end times are approximate when rally_end_estimated is true; inspect contact sheets for exact timing. "
-            "Serve times marked estimated were interpolated inside bounded shared intervals. No audio is used."
+            (
+                "Rally end times are approximate when rally_end_estimated is true; inspect contact sheets for exact timing. "
+                + (
+                    "TrackNet-refined estimates use a sustained calibrated main-court cluster near the player pause; "
+                    "points without one keep the player estimate. "
+                    if args.rally_end_source == "shuttle" else ""
+                )
+                + "Serve times marked estimated were interpolated inside bounded shared intervals. No audio is used."
+            )
             if end_estimation else
             "Set rally_end_sec to the last moment of live play; rally_duration_sec is rally_end_sec - serve_t. "
             "Shared unresolved intervals must be split visually first."
         ),
         "end_time_estimation": end_estimation,
+        "source_shuttle_tracks_json": shuttle_path.name if shuttle_path else None,
         "contact_sheet_index": os.path.relpath(index_path.resolve(), output_path.parent.resolve()),
         "unresolved_intervals": unresolved_gaps,
         "points": review_points,
@@ -615,12 +802,20 @@ def main() -> int:
     print(f"Contact sheet index: {index_path}")
     print(f"Editable review JSON: {output_path}")
     if end_estimation:
-        pause_count = sum(point.get("rally_end_method") == "first_sustained_pause" for point in review_points)
-        fallback_count = len(review_points) - pause_count
-        print(
-            f"Estimated rally ends: {len(review_points)}; first-pause estimates: {pause_count}; "
-            f"fallbacks: {fallback_count}; estimated serve times: {estimated_serve_times}."
-        )
+        if args.rally_end_source == "shuttle":
+            print(
+                f"Estimated rally ends: {len(review_points)}; TrackNet refinements: {shuttle_refined}; "
+                f"movement fallbacks: {shuttle_fallback}; estimated serve times: {estimated_serve_times}."
+            )
+        else:
+            pause_count = sum(point.get("rally_end_method") == "first_sustained_pause" for point in review_points)
+            fallback_count = len(review_points) - pause_count
+            print(
+                f"Estimated rally ends: {len(review_points)}; first-pause estimates: {pause_count}; "
+                f"fallbacks: {fallback_count}; estimated serve times: {estimated_serve_times}."
+            )
+    if shuttle_data is not None and args.rally_end_source == "players":
+        print(f"TrackNet evidence attached to {len(review_points)} review rows; rally ends were unchanged.")
     elif unresolved_gaps:
         print("Review the shared unresolved interval(s) to locate the untimed serve before assigning individual rally ends.")
     print("The 0-second dummy score point is excluded from video analysis.")

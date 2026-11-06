@@ -19,7 +19,8 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-from stage8_pose import POSE_CONNECTIONS, player_crop, posture_metrics
+from stage8_pose import POSE_CONNECTIONS, player_crop, posture_metrics, select_pose_for_box
+from shuttle_tracking import is_main_court_candidate, load_shuttle_tracks, validate_shuttle_video
 from video_encoding import h264_encoder_args, select_h264_encoder
 
 
@@ -109,7 +110,10 @@ def precompute_pose(
     track_times: list[float],
     pose_frames: list[dict[str, Any]],
     fps: float,
+    player_code: str = "R",
 ) -> list[dict[str, Any]]:
+    if player_code not in ("R", "O"):
+        raise ValueError("pose player code must be R or O")
     try:
         from mediapipe.tasks import python
         from mediapipe.tasks.python import vision
@@ -126,7 +130,7 @@ def precompute_pose(
     options = vision.PoseLandmarkerOptions(
         base_options=python.BaseOptions(model_asset_path=str(model_path)),
         running_mode=vision.RunningMode.VIDEO,
-        num_poses=1,
+        num_poses=2 if player_code == "O" else 1,
         min_pose_detection_confidence=0.35,
         min_pose_presence_confidence=0.35,
         min_tracking_confidence=0.35,
@@ -149,7 +153,8 @@ def precompute_pose(
             if not ok:
                 continue
             track_cursor = nearest_index(track_times, timestamp)
-            crop_data = player_crop(image, track_frames[track_cursor].get("rb"))
+            normalized_box = track_frames[track_cursor].get(f"{player_code.lower()}b")
+            crop_data = player_crop(image, normalized_box)
             if crop_data is None:
                 continue
             crop, origin_x, origin_y, side = crop_data
@@ -158,7 +163,21 @@ def precompute_pose(
             result = landmarker.detect_for_video(mp_image, round(timestamp * 1000))
             if not result.pose_landmarks:
                 continue
-            metrics = posture_metrics(result.pose_landmarks[0], side)
+            if player_code == "O":
+                landmarks = select_pose_for_box(
+                    result.pose_landmarks,
+                    normalized_box,
+                    origin_x,
+                    origin_y,
+                    side,
+                    image.shape[1],
+                    image.shape[0],
+                )
+                if landmarks is None:
+                    continue
+            else:
+                landmarks = result.pose_landmarks[0]
+            metrics = posture_metrics(landmarks, side)
             points = metrics.get("landmarks", [])
             visibility = metrics.get("visibility", {})
             if not points:
@@ -389,6 +408,116 @@ def draw_tracking(
         text(frame, label, (foot[0] - 33, label_y), 0.39, color, 1)
 
 
+def draw_shuttle_tracking(
+    frame: np.ndarray,
+    row: dict[str, Any] | None,
+    timestamp: float,
+    history: deque,
+) -> None:
+    """Draw a short raw TrackNet trail, skipping points outside the calibrated main court margin."""
+    if history and timestamp <= history[-1][0]:
+        history.clear()
+    if row is not None and row.get("visible") and is_main_court_candidate(row):
+        point = (round(float(row["x_px"])), round(float(row["y_px"])))
+        history.append((timestamp, point))
+    elif row is not None and row.get("court_region") == "outside":
+        history.clear()
+
+    items = list(history)
+    for index in range(1, len(items)):
+        age = timestamp - items[index][0]
+        if age > 0.45:
+            continue
+        strength = max(0.25, 1.0 - age / 0.45)
+        color = (round(70 * strength), round(240 * strength), 255)
+        cv2.line(frame, items[index - 1][1], items[index][1], color, 2, cv2.LINE_AA)
+    if items and timestamp - items[-1][0] <= 0.12:
+        cv2.circle(frame, items[-1][1], 5, (40, 245, 255), -1, cv2.LINE_AA)
+        cv2.circle(frame, items[-1][1], 7, (255, 255, 255), 1, cv2.LINE_AA)
+
+
+def shot_count_at_time(point: dict[str, Any] | None, timestamp: float) -> int | None:
+    if point is None or not finite(point.get("shot_count")):
+        return None
+    start_t, end_t = point.get("serve_t"), point.get("rally_end_sec")
+    if not finite(start_t) or not finite(end_t) or timestamp < float(start_t):
+        return None
+    final_count = max(0, int(round(float(point["shot_count"]))))
+    if timestamp >= float(end_t):
+        return final_count
+    crossings = point.get("shot_count_candidate_crossings", [])
+    observed_crossings = sum(
+        1 for event in crossings
+        if isinstance(event, dict) and finite(event.get("t_sec")) and float(event["t_sec"]) <= timestamp
+    ) if isinstance(crossings, list) else 0
+    estimate = point.get("estimated_shot_count")
+    if (
+        point.get("shot_count_source") == "manual_review"
+        and finite(estimate)
+        and float(estimate) > 0
+        and isinstance(crossings, list)
+        and crossings
+    ):
+        count = round(observed_crossings * final_count / float(estimate))
+    else:
+        count = observed_crossings
+    return min(final_count, count)
+
+
+def draw_shot_counter(frame: np.ndarray, count: int | None, estimated: bool) -> None:
+    width = min(280, frame.shape[1] - 32)
+    height = 46
+    x = frame.shape[1] - width - 18
+    y = 14
+    overlay_panel(frame, (x, y, x + width, y + height), 0.72)
+    cv2.rectangle(frame, (x, y), (x + width, y + height), (125, 150, 160), 1, cv2.LINE_AA)
+    separator = x + width - 72
+    cv2.line(frame, (separator, y + 7), (separator, y + height - 7), (120, 140, 150), 1)
+    text(frame, "No. of shots", (x + 12, y + 29), 0.53, (220, 230, 235), 1)
+    value = "—" if count is None else f"~{count}" if estimated else str(count)
+    text(frame, value, (separator + 17, y + 31), 0.62, (250, 250, 250), 2)
+
+
+def longest_rally_callout_info(report: dict[str, Any]) -> dict[str, Any] | None:
+    effort = report.get("rally_effort_analysis", {})
+    longest = effort.get("longest_rally") if isinstance(effort, dict) else None
+    if isinstance(longest, dict) and finite(longest.get("shot_count")):
+        return {**longest, "label": "LONGEST RALLY"}
+    candidates = [
+        row for row in report.get("video_points", [])
+        if isinstance(row, dict)
+        and finite(row.get("rally_duration_sec"))
+        and finite(row.get("shot_count"))
+    ]
+    if not candidates:
+        return None
+    longest = max(candidates, key=lambda row: float(row["rally_duration_sec"]))
+    return {
+        "point_n": longest.get("point_n"),
+        "video_serve_number": longest.get("video_serve_number"),
+        "duration_sec": longest.get("rally_duration_sec"),
+        "shot_count": longest.get("shot_count"),
+        "shot_count_source": longest.get("shot_count_source"),
+        "label": "LONGEST RALLY WITH TRACK DATA",
+    }
+
+
+def draw_longest_rally_callout(frame: np.ndarray, info: dict[str, Any]) -> None:
+    width = min(520, frame.shape[1] - 36)
+    height = 58
+    x = (frame.shape[1] - width) // 2
+    y = frame.shape[0] - height - 18
+    overlay_panel(frame, (x, y, x + width, y + height), 0.76)
+    cv2.rectangle(frame, (x, y), (x + width, y + height), (145, 170, 180), 1, cv2.LINE_AA)
+    serve = info.get("video_serve_number") or info.get("point_n") or "?"
+    title = f"{info['label']}  |  SERVE {serve}"
+    count_value = int(round(float(info["shot_count"])))
+    count_text = f"~{count_value}" if info.get("shot_count_source") != "manual_review" else str(count_value)
+    details = f"{float(info['duration_sec']):.1f} seconds  |  {count_text} shots"
+    text(frame, title, (x + 14, y + 22), 0.43, (190, 215, 225), 1)
+    text(frame, details, (x + 14, y + 46), 0.56, (250, 250, 250), 1)
+
+
 def wrap_text(value: str, max_width: int, scale: float, thickness: int = 1) -> list[str]:
     value = value.translate(DISPLAY_TRANSLATION)
     output: list[str] = []
@@ -425,6 +554,133 @@ def analysis_slide(width: int, height: int, eyebrow: str, title: str) -> np.ndar
     cv2.rectangle(frame, (0, 0), (12, height), (210, 190, 65), -1)
     text(frame, eyebrow.upper(), (42, 42), 0.43, (190, 210, 220), 1)
     text(frame, title, (42, 88), 0.92, (248, 248, 245), 2)
+    return frame
+
+
+def centered_text(
+    frame: np.ndarray, label: str, center_x: int, baseline_y: int,
+    scale: float, color: tuple[int, int, int], thickness: int = 1,
+) -> None:
+    display_label = label.translate(DISPLAY_TRANSLATION)
+    width = cv2.getTextSize(display_label, FONT, scale, thickness)[0][0]
+    text(frame, label, (round(center_x - width / 2), baseline_y), scale, color, thickness)
+
+
+def draw_trophy(frame: np.ndarray, center_x: int, top_y: int, height: int = 42) -> None:
+    """Draw a small gold trophy with OpenCV primitives (no external font or asset)."""
+    gold = (50, 190, 255)
+    dark_gold = (20, 115, 190)
+    scale = height / 42.0
+    half = max(7, round(12 * scale))
+    bowl_top = top_y + round(4 * scale)
+    bowl_bottom = top_y + round(23 * scale)
+    points = np.asarray([
+        [center_x - half, bowl_top], [center_x + half, bowl_top],
+        [center_x + round(8 * scale), bowl_bottom], [center_x - round(8 * scale), bowl_bottom],
+    ], dtype=np.int32)
+    cv2.fillConvexPoly(frame, points, gold, cv2.LINE_AA)
+    cv2.polylines(frame, [points], True, dark_gold, max(1, round(1.5 * scale)), cv2.LINE_AA)
+    cv2.ellipse(
+        frame, (center_x - round(half * 0.8), top_y + round(12 * scale)),
+        (round(8 * scale), round(7 * scale)), 0, 65, 295, gold,
+        max(1, round(2 * scale)), cv2.LINE_AA,
+    )
+    cv2.ellipse(
+        frame, (center_x + round(half * 0.8), top_y + round(12 * scale)),
+        (round(8 * scale), round(7 * scale)), 0, 245, 115, gold,
+        max(1, round(2 * scale)), cv2.LINE_AA,
+    )
+    cv2.line(frame, (center_x, bowl_bottom), (center_x, top_y + round(33 * scale)), gold, max(2, round(3 * scale)), cv2.LINE_AA)
+    cv2.rectangle(
+        frame,
+        (center_x - round(9 * scale), top_y + round(34 * scale)),
+        (center_x + round(9 * scale), top_y + round(38 * scale)),
+        gold, -1, cv2.LINE_AA,
+    )
+    cv2.rectangle(
+        frame,
+        (center_x - round(13 * scale), top_y + round(39 * scale)),
+        (center_x + round(13 * scale), top_y + round(42 * scale)),
+        dark_gold, -1, cv2.LINE_AA,
+    )
+
+
+def draw_opening_title_slide(
+    width: int,
+    height: int,
+    names: dict[str, str],
+    final_score: dict[str, Any] | None,
+) -> np.ndarray:
+    frame = np.empty((height, width, 3), dtype=np.uint8)
+    top_color = np.asarray((24, 27, 37), dtype=np.float32)
+    bottom_color = np.asarray((39, 32, 25), dtype=np.float32)
+    for y in range(height):
+        fraction = y / max(1, height - 1)
+        frame[y, :] = np.round(top_color * (1.0 - fraction) + bottom_color * fraction).astype(np.uint8)
+    cv2.rectangle(frame, (0, 0), (10, height), COLORS["R"], -1)
+    cv2.rectangle(frame, (width - 10, 0), (width, height), COLORS["O"], -1)
+    cv2.line(frame, (74, 88), (width - 74, 88), (91, 105, 113), 1, cv2.LINE_AA)
+    centered_text(frame, "SINGLES MATCH", width // 2, 62, 0.46, (181, 201, 210), 1)
+
+    left_center, right_center = round(width * 0.27), round(width * 0.73)
+    vs_center = width // 2
+    for code, center in (("R", left_center), ("O", right_center)):
+        name = names.get(code, "Player") or "Player"
+        color = COLORS[code]
+        display_name = name.translate(DISPLAY_TRANSLATION)
+        thickness = 2
+        max_name_width = round(width * 0.34)
+        scale = min(1.12, max_name_width / max(1, cv2.getTextSize(display_name, FONT, 1.12, thickness)[0][0]))
+        name_width = cv2.getTextSize(display_name, FONT, scale, thickness)[0][0]
+        winner = (
+            isinstance(final_score, dict)
+            and finite(final_score.get(code))
+            and finite(final_score.get("O" if code == "R" else "R"))
+            and float(final_score[code]) > float(final_score["O" if code == "R" else "R"])
+        )
+        icon_width = 40 if winner else 0
+        gap = 12 if winner else 0
+        group_width = name_width + icon_width + gap
+        group_left = round(center - group_width / 2)
+        name_x = group_left + icon_width + gap
+        text(frame, name, (name_x, 174), scale, color, thickness)
+        if winner:
+            draw_trophy(frame, group_left + 18, 140, 38)
+            centered_text(frame, "WINNER", center, 207, 0.32, (221, 196, 105), 1)
+    centered_text(frame, "VS", vs_center, 174, 0.55, (201, 205, 204), 1)
+
+    score_top, score_bottom = 250, 368
+    card_width = round(width * 0.30)
+    for code, center in (("R", left_center), ("O", right_center)):
+        x1, x2 = round(center - card_width / 2), round(center + card_width / 2)
+        cv2.rectangle(frame, (x1, score_top), (x2, score_bottom), (70, 76, 82), 1, cv2.LINE_AA)
+        overlay_panel(frame, (x1 + 1, score_top + 1, x2, score_bottom), 0.74)
+        centered_text(frame, "FINAL SCORE", center, score_top + 31, 0.36, (171, 185, 190), 1)
+        value = final_score.get(code) if isinstance(final_score, dict) else None
+        score_text = str(int(value)) if finite(value) else "-"
+        centered_text(frame, score_text, center, score_top + 91, 1.52, COLORS[code], 2)
+        cv2.line(frame, (x1 + 28, score_bottom - 16), (x2 - 28, score_bottom - 16), COLORS[code], 2, cv2.LINE_AA)
+    centered_text(frame, "-", vs_center, score_top + 91, 0.9, (200, 205, 207), 1)
+
+    title = "AI Match Analysis"
+    title_scale = min(1.55, (width - 120) / max(
+        1, cv2.getTextSize(title, FONT, 1.55, 2)[0][0]
+    ))
+    centered_text(frame, title, width // 2, 505, title_scale, (248, 248, 244), 2)
+    centered_text(frame, "SCORE  /  MOVEMENT  /  COACHING", width // 2, 552, 0.42, (174, 194, 199), 1)
+    cv2.line(frame, (width // 2 - 70, 590), (width // 2 + 70, 590), (205, 183, 103), 2, cv2.LINE_AA)
+    return frame
+
+
+def draw_section_title_slide(width: int, height: int, title: str, subtitle: str) -> np.ndarray:
+    frame = np.full((height, width, 3), (27, 25, 19), dtype=np.uint8)
+    cv2.rectangle(frame, (0, 0), (10, height), (210, 190, 65), -1)
+    cv2.line(frame, (width // 2 - 52, 166), (width // 2 + 52, 166), (210, 190, 65), 2, cv2.LINE_AA)
+    centered_text(frame, "AI MATCH ANALYSIS", width // 2, 142, 0.45, (181, 201, 210), 1)
+    title_scale = min(1.6, (width - 100) / max(1, cv2.getTextSize(title.upper(), FONT, 1.6, 2)[0][0]))
+    centered_text(frame, title.upper(), width // 2, height // 2 + 15, title_scale, (248, 248, 244), 2)
+    centered_text(frame, subtitle, width // 2, height // 2 + 68, 0.48, (190, 205, 210), 1)
+    cv2.line(frame, (width // 2 - 52, height - 154), (width // 2 + 52, height - 154), (210, 190, 65), 2, cv2.LINE_AA)
     return frame
 
 
@@ -588,12 +844,18 @@ def draw_review_banner(frame: np.ndarray, example: dict[str, Any], index: int, t
     )
 
 
-def highlight_examples(report: dict[str, Any]) -> list[dict[str, Any]]:
+def highlight_examples(report: dict[str, Any], player_code: str | None = None) -> list[dict[str, Any]]:
+    report_code = report.get("analysis_subject_code", "R")
+    player_code = player_code or report_code
+    if player_code not in ("R", "O"):
+        raise ValueError("analysis player code must be R or O")
+    if player_code != report_code:
+        raise ValueError(f"report data is prepared for {report_code}, not {player_code}")
     examples = report.get("example_lost_points", [])
     wanted = (
         ("representative short", "SHORT RALLY LOSS"),
-        ("longest R loss", "LONG RALLY LOSS"),
-        ("highest R movement", "HIGHEST TRACKED MOVEMENT"),
+        (f"longest {player_code} loss", "LONG RALLY LOSS"),
+        (f"highest {player_code} movement", "HIGHEST TRACKED MOVEMENT"),
     )
     selected = []
     for prefix, title in wanted:
@@ -604,7 +866,8 @@ def highlight_examples(report: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def highlight_frame_time(
-    example: dict[str, Any], track_frames: list[dict[str, Any]], track_times: list[float]
+    example: dict[str, Any], track_frames: list[dict[str, Any]], track_times: list[float],
+    player_code: str = "R",
 ) -> float:
     if example["title"] != "HIGHEST TRACKED MOVEMENT":
         return float(example["rally_end_sec"])
@@ -612,7 +875,7 @@ def highlight_frame_time(
     lo, hi = bisect.bisect_left(track_times, start), bisect.bisect_right(track_times, end)
     candidates = []
     for index in range(lo, hi):
-        position = point2(track_frames[index].get("r"))
+        position = point2(track_frames[index].get(player_code.lower()))
         if position is not None:
             local_position = (
                 (COURT_W - position[0], COURT_L - position[1])
@@ -627,6 +890,9 @@ def read_coach_narrative(path: Path) -> dict[str, Any]:
         return {}
     content = path.read_text(encoding="utf-8")
     sections: dict[str, Any] = {"serves": {}}
+    subject = re.search(r"<!--\s*analysis_subject_code:\s*([RO])\s*-->", content, re.IGNORECASE)
+    if subject:
+        sections["analysis_subject_code"] = subject.group(1).upper()
     buffers: dict[tuple[str, int | None], list[str]] = {}
     current: tuple[str, int | None] | None = None
     recognized_heading = False
@@ -694,11 +960,58 @@ def narration_text(event: dict[str, Any], coach_sections: dict[str, Any]) -> str
     return f"Serve {serve_number}, beginning at about {timestamp:.0f} seconds. {note}"
 
 
-def create_voice(path: Path, message: str, voice: str, rate: int) -> None:
+def create_voice(
+    path: Path, message: str, voice: str, rate: int, sentence_pause_ms: int = 600
+) -> None:
     say = shutil.which("say")
     if not say:
         raise RuntimeError("macOS 'say' was not found; use --no-voice or install a local TTS command")
-    subprocess.run([say, "-v", voice, "-r", str(rate), "-o", str(path), message], check=True)
+    sentences = [
+        value.strip()
+        for value in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", message.strip())
+        if value.strip()
+    ]
+    if len(sentences) <= 1 or sentence_pause_ms <= 0:
+        subprocess.run([say, "-v", voice, "-r", str(rate), "-o", str(path), message], check=True)
+        return
+
+    with tempfile.TemporaryDirectory(prefix=f"{path.stem}_sentences_", dir=path.parent) as temp_name:
+        temp_dir = Path(temp_name)
+        sentence_files = []
+        for index, sentence in enumerate(sentences):
+            sentence_path = temp_dir / f"sentence_{index:02d}.aiff"
+            subprocess.run(
+                [say, "-v", voice, "-r", str(rate), "-o", str(sentence_path), sentence],
+                check=True,
+            )
+            sentence_files.append(sentence_path)
+
+        silence_path = temp_dir / "sentence_pause.aiff"
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "anullsrc=r=22050:cl=mono",
+                "-t", f"{sentence_pause_ms / 1000.0:.3f}",
+                "-c:a", "pcm_s16be", "-f", "aiff", str(silence_path),
+            ],
+            check=True,
+        )
+        concat_list = temp_dir / "sentences.txt"
+        concat_entries = []
+        for index, sentence_path in enumerate(sentence_files):
+            concat_entries.append(f"file '{sentence_path.name}'")
+            if index + 1 < len(sentence_files):
+                concat_entries.append(f"file '{silence_path.name}'")
+        concat_list.write_text("\n".join(concat_entries) + "\n", encoding="utf-8")
+        subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(concat_list),
+                "-c:a", "pcm_s16be", "-f", "aiff", str(path),
+            ],
+            cwd=temp_dir,
+            check=True,
+        )
 
 
 def has_audio(path: Path) -> bool:
@@ -820,6 +1133,14 @@ def render(args: argparse.Namespace) -> None:
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path is None or shutil.which("ffprobe") is None:
         raise RuntimeError("ffmpeg and ffprobe must be available on PATH")
+    if args.sentence_pause_ms < 0 or args.sentence_pause_ms > 3000:
+        raise ValueError("sentence pause must be between 0 and 3000 milliseconds")
+    if (
+        args.longest_rally_interval_sec <= 0
+        or args.longest_rally_duration_sec <= 0
+        or args.longest_rally_duration_sec >= args.longest_rally_interval_sec
+    ):
+        raise ValueError("longest-rally callout duration must be positive and shorter than its interval")
     video_encoder = select_h264_encoder(ffmpeg_path, args.video_encoder)
     print(f"Stage 11 video encoder: {video_encoder}", flush=True)
     if video_encoder == "h264_videotoolbox":
@@ -831,20 +1152,44 @@ def render(args: argparse.Namespace) -> None:
     rallies_data = read_json(args.rallies_json)
     pose_data = read_json(args.pose_json)
     report = read_json(args.report_json)
-    coach_narrative_path = (args.coach_narrative or args.report_json.parent / "AI-coach-narrative.md").expanduser()
+    report_player_code = report.get("analysis_subject_code", "R")
+    player_code = args.player_code or report_player_code
+    if player_code not in ("R", "O") or report_player_code not in ("R", "O"):
+        raise ValueError("analysis player code must be R or O")
+    if player_code != report_player_code:
+        raise ValueError(
+            f"report_data.json is prepared for {report_player_code}; rerun Stage 10 with --player-code {player_code}"
+        )
+    pose_player_code = pose_data.get("player_code", "R")
+    if pose_player_code != player_code:
+        raise ValueError(
+            f"pose_stats.json is prepared for {pose_player_code}; rerun Stage 8 with --player-code {player_code}"
+        )
+    opponent_code = "O" if player_code == "R" else "R"
+    narrative_suffix = "" if player_code == "R" else "-O"
+    coach_narrative_path = (
+        args.coach_narrative or args.report_json.parent / f"AI-coach-narrative{narrative_suffix}.md"
+    ).expanduser()
     coach_sections = read_coach_narrative(coach_narrative_path)
+    narrative_player_code = coach_sections.get("analysis_subject_code")
+    if narrative_player_code is not None and narrative_player_code != player_code:
+        raise ValueError(
+            f"coach narrative is for {narrative_player_code}; use a {player_code} narrative or omit --coach-narrative"
+        )
+    if player_code == "O" and coach_sections and narrative_player_code != "O":
+        raise ValueError("O coach narrative must include the analysis_subject_code metadata from Stage 10A")
     if coach_sections:
         print(f"AI coach narrative loaded: {coach_narrative_path}", flush=True)
     else:
         print("No AI coach narrative found; using Stage 10 coaching notes.", flush=True)
     report_names = report.get("player_names", {})
-    player_name = (args.player_name or report_names.get("R") or "").strip()
-    opponent_name = (args.opponent_name or report_names.get("O") or "").strip()
-    if not player_name:
-        player_name = input("Your name (Stage 3 selected R player): ").strip() or "Player R"
-    if not opponent_name:
-        opponent_name = input("Opponent's name (O player): ").strip() or "Player O"
-    names = {"R": player_name, "O": opponent_name}
+    r_name = (args.r_name or report_names.get("R") or "").strip()
+    o_name = (args.o_name or report_names.get("O") or "").strip()
+    if not r_name:
+        r_name = input("Name assigned to Stage 3 identity R: ").strip() or "Player R"
+    if not o_name:
+        o_name = input("Name assigned to Stage 3 identity O: ").strip() or "Player O"
+    names = {"R": r_name, "O": o_name}
     track_frames = players.get("frames")
     points = rallies_data.get("points")
     if not isinstance(track_frames, list) or not track_frames or not isinstance(points, list):
@@ -858,12 +1203,15 @@ def render(args: argparse.Namespace) -> None:
         if int(rally["point_n"]) not in report_points:
             continue
         rally.update({key: report_points[int(rally["point_n"])].get(key) for key in (
-            "outcome", "R_distance_m", "length_bucket", "score_before", "score_after", "video_serve_number"
+            "outcome", "R_distance_m", "O_distance_m", "player_distance_m", "opponent_distance_m",
+            "length_bucket", "score_before", "score_after", "video_serve_number",
+            "shot_count", "estimated_shot_count", "manual_shot_count", "shot_count_source",
+            "shot_count_quality", "shot_count_candidate_crossings",
         )})
     points = sorted((row for row in points if finite(row.get("serve_t")) and finite(row.get("rally_end_sec"))), key=lambda row: float(row["serve_t"]))
-    examples = highlight_examples(report)
+    examples = highlight_examples(report, player_code)
     if not examples:
-        raise ValueError("report data has no timestamped lost-point examples; regenerate it with Stage 10")
+        raise ValueError(f"report data has no timestamped lost-point examples for {player_code}; regenerate Stage 10")
     for example in examples:
         if not finite(example.get("serve_t")) or not finite(example.get("rally_end_sec")):
             raise ValueError(f"Stage 10 review at score point {example.get('point_n', '?')} needs serve and rally-end timestamps")
@@ -885,6 +1233,27 @@ def render(args: argparse.Namespace) -> None:
     if fps <= 0 or width <= 0 or height <= 0 or frame_count <= 0:
         raise RuntimeError("input video has invalid frame properties")
     duration = frame_count / fps
+    shuttle_path = args.shuttle_tracks.expanduser().resolve() if args.shuttle_tracks else None
+    if shuttle_path is not None and shuttle_path in (args.video.resolve(), args.output_video.resolve()):
+        raise ValueError("TrackNet JSON must be separate from the Stage 11 video and output")
+    shuttle_data = load_shuttle_tracks(shuttle_path) if shuttle_path else None
+    if shuttle_data is not None:
+        validate_shuttle_video(shuttle_data, args.video.resolve())
+    shuttle_rows = shuttle_data.get("frames", []) if shuttle_data else []
+    shuttle_times = shuttle_data.get("_times", []) if shuttle_data else []
+    shot_counter_enabled = bool(shuttle_data or args.shot_count_only)
+    shot_count_available = any(
+        isinstance(row, dict) and finite(row.get("shot_count"))
+        for row in report.get("video_points", [])
+    )
+    if shot_counter_enabled and not shot_count_available:
+        raise ValueError(
+            "shot counter requested but report_data.json has no shot counts; rerun Stage 7 with calibrated TrackNet tracks, then rerun Stage 10"
+        )
+    shuttle_overlay_enabled = bool(
+        shuttle_data and not args.no_shuttle_overlay and not args.shot_count_only
+    )
+    longest_rally_info = longest_rally_callout_info(report) if shot_counter_enabled else None
     heatmap_commentary = heatmap_data.get("coaching_commentary", [])
     if not heatmap_commentary:
         heatmap_commentary = ["Compare opening, middle, and closing court coverage before changing movement choices."]
@@ -922,7 +1291,7 @@ def render(args: argparse.Namespace) -> None:
         if not args.no_pose:
             pose_samples = precompute_pose(
                 args.video, pose_model, track_frames, track_times,
-                pose_data.get("frames", []), fps,
+                pose_data.get("frames", []), fps, player_code,
             )
         pose_times = [row["t"] for row in pose_samples]
 
@@ -932,7 +1301,7 @@ def render(args: argparse.Namespace) -> None:
             try:
                 for i, message in enumerate(voice_texts):
                     path = tmp / f"coach_voice_{i:02d}.aiff"
-                    create_voice(path, message, args.voice, args.voice_rate)
+                    create_voice(path, message, args.voice, args.voice_rate, args.sentence_pause_ms)
                     if media_duration(path) < 0.1:
                         raise RuntimeError(f"the local voice '{args.voice}' produced an empty audio file")
                     voice_files.append(path)
@@ -941,12 +1310,18 @@ def render(args: argparse.Namespace) -> None:
                 voice_files = []
                 voice_enabled = False
         voice_lengths = [media_duration(path) for path in voice_files]
+        opening_slide_duration = 2.5
+        section_slide_duration = 2.5
         intro_duration = max(9.0, voice_lengths[0] + 0.8) if voice_enabled else 9.0
         heatmap_duration = max(12.0, voice_lengths[1] + 0.8) if voice_enabled else 12.0
         freeze_duration = max(4.0, float(args.freeze_duration))
         if voice_enabled and len(voice_lengths) > 2:
             freeze_duration = max(freeze_duration, max(voice_lengths[2:]) + 0.8)
-        voice_starts: list[float] = [0.0, intro_duration] if voice_enabled else []
+        # Narration starts with the score graph, after the opening title card.
+        voice_starts: list[float] = (
+            [opening_slide_duration, opening_slide_duration + intro_duration]
+            if voice_enabled else []
+        )
         source_audio_segments: list[tuple[float, float, float]] = []
         written_frames = 0
 
@@ -966,6 +1341,7 @@ def render(args: argparse.Namespace) -> None:
         if encoder.stdin is None:
             raise RuntimeError("could not open ffmpeg video input")
         speeds = {player: compute_speeds(track_frames, track_times, player) for player in ("R", "O")}
+        shuttle_history: deque = deque(maxlen=15)
         max_heat_counts = {player: 0 for player in ("R", "O")}
         for phase in heatmap_phases:
             for player in ("R", "O"):
@@ -979,24 +1355,48 @@ def render(args: argparse.Namespace) -> None:
 
         def draw_annotated(
             image: np.ndarray, timestamp: float, histories: dict[str, deque],
-            track_cursor: int, point_cursor: int,
+            track_cursor: int, point_cursor: int, show_longest_callout: bool = False,
         ) -> tuple[np.ndarray, int, int, dict[str, Any] | None]:
             tracked, track_cursor = frame_track(track_frames, track_times, timestamp, track_cursor)
             location = {player: point2(tracked.get(player.lower())) for player in ("R", "O")}
             speed_index = nearest_index(track_times, timestamp)
             speeds_now = {player: speeds[player][speed_index] for player in ("R", "O")}
             draw_tracking(image, tracked, histories, timestamp, names)
+            if shuttle_overlay_enabled and shuttle_rows:
+                shuttle_index = nearest_index(shuttle_times, timestamp)
+                draw_shuttle_tracking(image, shuttle_rows[shuttle_index], timestamp, shuttle_history)
             this_point, point_cursor = current_point(points, timestamp, point_cursor)
             next_point = points[point_cursor + 1] if point_cursor + 1 < len(points) else None
             draw_hud(image, this_point, next_point, timestamp, names)
             draw_minimap(image, location, speeds_now)
             draw_pose(image, pose_at(pose_samples, pose_times, timestamp))
+            if shot_counter_enabled:
+                count = shot_count_at_time(this_point, timestamp)
+                if count is not None:
+                    draw_shot_counter(
+                        image, count,
+                        estimated=this_point.get("shot_count_source") != "manual_review",
+                    )
+                elif this_point is not None:
+                    # Distinguish unavailable tracking from a true zero-shot rally.
+                    draw_shot_counter(image, None, estimated=True)
+            if (
+                show_longest_callout
+                and longest_rally_info is not None
+                and timestamp % args.longest_rally_interval_sec < args.longest_rally_duration_sec
+            ):
+                draw_longest_rally_callout(image, longest_rally_info)
             return image, track_cursor, point_cursor, this_point
 
         def timeline_sec() -> float:
             return written_frames / fps
 
         try:
+            final_score = report.get("score", {}).get("final")
+            opening_slide = draw_opening_title_slide(width, height, names, final_score)
+            for _ in range(round(opening_slide_duration * fps)):
+                write_frame(opening_slide)
+
             for frame_index in range(max(1, round(intro_duration * fps))):
                 image = analysis_slide(width, height, "Match analysis", "Score progression")
                 visible = max(1, math.ceil((frame_index + 1) / max(1, round(intro_duration * fps)) * len(score_curve)))
@@ -1018,6 +1418,12 @@ def render(args: argparse.Namespace) -> None:
                     )
                     write_frame(image)
 
+            coaching_slide = draw_section_title_slide(
+                width, height, "Coaching", "Three in-depth rally reviews",
+            )
+            for _ in range(round(section_slide_duration * fps)):
+                write_frame(coaching_slide)
+
             for example_index, example in enumerate(examples, start=1):
                 source_start = max(0.0, float(example["serve_t"]) - 0.4)
                 source_end = min(duration, float(example["rally_end_sec"]) + 0.35)
@@ -1026,15 +1432,53 @@ def render(args: argparse.Namespace) -> None:
                 start_frame = min(frame_count - 1, max(0, round(source_start * fps)))
                 end_frame = min(frame_count - 1, max(start_frame, round(source_end * fps)))
                 source_start_actual = start_frame / fps
-                review_timeline_start = timeline_sec()
+                highlight_time = highlight_frame_time(example, track_frames, track_times, player_code)
+                highlight_frame = min(frame_count - 1, max(0, round(highlight_time * fps)))
                 review_capture = cv2.VideoCapture(str(args.video))
                 if not review_capture.isOpened():
                     raise RuntimeError(f"could not reopen video for review clip: {args.video}")
+
+                # Show the coach's still and explanation first. Use the rally-end
+                # frame, or the movement peak for the high-movement example, so
+                # the audience can see the moment being discussed before replay.
+                review_capture.set(cv2.CAP_PROP_POS_FRAMES, highlight_frame)
+                ok, still = review_capture.read()
+                if not ok:
+                    review_capture.release()
+                    raise RuntimeError(
+                        f"could not read the review still for serve {example.get('video_serve_number', example['point_n'])}"
+                    )
+                shuttle_history.clear()
+                still_histories = {"R": deque(maxlen=75), "O": deque(maxlen=75)}
+                still_track_cursor = max(0, bisect.bisect_right(track_times, highlight_frame / fps) - 1)
+                still_point_cursor = -1
+                still, _, _, _ = draw_annotated(
+                    still, highlight_frame / fps, still_histories, still_track_cursor, still_point_cursor,
+                )
+                draw_review_banner(still, example, example_index, len(examples))
+                duration_text = example.get("rally_duration_sec")
+                duration_label = f"estimated rally: {duration_text:.1f} s" if finite(duration_text) else "rally duration estimate unavailable"
+                confidence = str(example.get("rally_end_confidence") or "unrated")
+                coach_note = review_coach_note(example, coach_sections)
+                card = draw_freeze_card(
+                    still,
+                    f"COACH REVIEW  ·  SERVE {example.get('video_serve_number', example['point_n'])}  ·  {example['title']}",
+                    coach_note,
+                    f"Serve time {float(example['serve_t']):.1f}s  |  end estimate confidence: {confidence}  |  {duration_label}",
+                )
+                freeze_start = timeline_sec()
+                if voice_enabled and example_index - 1 < len(review_voice_texts):
+                    voice_starts.append(freeze_start)
+                for _ in range(round(freeze_duration * fps)):
+                    write_frame(card)
+
+                # Follow the coach card with the matching rally replay.
+                review_timeline_start = timeline_sec()
                 review_capture.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+                shuttle_history.clear()
                 histories = {"R": deque(maxlen=75), "O": deque(maxlen=75)}
                 track_cursor = max(0, bisect.bisect_right(track_times, source_start_actual) - 1)
                 point_cursor = -1
-                last_image: np.ndarray | None = None
                 source_index = start_frame
                 try:
                     while source_index <= end_frame:
@@ -1047,32 +1491,22 @@ def render(args: argparse.Namespace) -> None:
                         )
                         draw_review_banner(image, example, example_index, len(examples))
                         write_frame(image)
-                        last_image = image.copy()
                         source_index += 1
                 finally:
                     review_capture.release()
-                if last_image is None:
+                if source_index == start_frame:
                     raise RuntimeError(f"no frames could be read for review serve {example.get('video_serve_number', example['point_n'])}")
                 source_end_actual = source_index / fps
                 source_audio_segments.append((review_timeline_start, source_start_actual, source_end_actual))
-                freeze_start = timeline_sec()
-                if voice_enabled and example_index - 1 < len(review_voice_texts):
-                    voice_starts.append(freeze_start)
-                duration_text = example.get("rally_duration_sec")
-                duration_label = f"estimated rally: {duration_text:.1f} s" if finite(duration_text) else "rally duration estimate unavailable"
-                confidence = str(example.get("rally_end_confidence") or "unrated")
-                coach_note = review_coach_note(example, coach_sections)
-                card = draw_freeze_card(
-                    last_image,
-                    f"REVIEW  ·  SERVE {example.get('video_serve_number', example['point_n'])}  ·  {example['title']}",
-                    coach_note,
-                    f"Serve time {float(example['serve_t']):.1f}s  |  end estimate confidence: {confidence}  |  {duration_label}",
-                )
-                for _ in range(round(freeze_duration * fps)):
-                    write_frame(card)
 
-            full_match_start = timeline_sec()
             if not args.short_mode:
+                full_match_slide = draw_section_title_slide(
+                    width, height, "Full Match", "Annotated match footage",
+                )
+                for _ in range(round(section_slide_duration * fps)):
+                    write_frame(full_match_slide)
+
+                full_match_start = timeline_sec()
                 source_audio_segments.append((full_match_start, 0.0, duration))
                 video = cv2.VideoCapture(str(args.video))
                 if not video.isOpened():
@@ -1089,6 +1523,7 @@ def render(args: argparse.Namespace) -> None:
                         timestamp = frame_index / fps
                         image, track_cursor, point_cursor, _ = draw_annotated(
                             image, timestamp, histories, track_cursor, point_cursor,
+                            show_longest_callout=True,
                         )
                         write_frame(image)
                         frame_index += 1
@@ -1104,9 +1539,14 @@ def render(args: argparse.Namespace) -> None:
             if return_code != 0:
                 details = encoder.stderr.read().decode("utf-8", "replace") if encoder.stderr else ""
                 raise RuntimeError(f"ffmpeg video encoding failed ({return_code}): {details[-2000:]}")
-        except (BrokenPipeError, OSError):
-            encoder.kill()
-            raise
+        except (BrokenPipeError, OSError) as exc:
+            if encoder.poll() is None:
+                encoder.kill()
+            return_code = encoder.wait()
+            details = encoder.stderr.read().decode("utf-8", "replace") if encoder.stderr else ""
+            raise RuntimeError(
+                f"ffmpeg video encoding stopped ({return_code}): {details[-2000:] or exc}"
+            ) from exc
         finally:
             if encoder.poll() is None:
                 encoder.kill()
@@ -1118,7 +1558,22 @@ def render(args: argparse.Namespace) -> None:
         )
 
     match_text = "analysis-only short mode" if args.short_mode else f"{frame_count} full-match frames"
-    print(f"Stage 11 video complete: score intro, heatmap time-lapse, {len(examples)} replay/freeze reviews, {match_text}.")
+    print(
+        f"Stage 11 video complete: opening title, score intro, heatmap time-lapse, "
+        f"Coaching title, {len(examples)} coach-card/replay reviews, {match_text}."
+    )
+    print(
+        f"TrackNet shuttle trail: {'included' if shuttle_overlay_enabled else 'omitted'}" +
+        (" (no TrackNet JSON supplied)." if shuttle_data is None else ".")
+    )
+    print(f"Rally shot counter: {'included' if shot_counter_enabled else 'omitted'}.")
+    if longest_rally_info is not None and not args.short_mode:
+        print(
+            f"Longest-rally callout: every {args.longest_rally_interval_sec:g}s for "
+            f"{args.longest_rally_duration_sec:g}s."
+        )
+    if voice_enabled:
+        print(f"Sentence pause: {args.sentence_pause_ms} ms.")
     print(f"Voice-over: {'local narration' if voice_enabled else 'on-screen captions only'}.")
     print(f"Output: {args.output_video}")
 
@@ -1131,12 +1586,37 @@ def main() -> int:
     parser.add_argument("pose_json", type=Path, help="Stage 8 pose_stats.json")
     parser.add_argument("report_json", type=Path, help="Stage 10 report_data.json")
     parser.add_argument("output_video", type=Path, help="annotated MP4 output")
-    parser.add_argument("--player-name", help="name shown for the Stage 3 selected R player; prompted if omitted")
-    parser.add_argument("--opponent-name", help="name shown for the O opponent; prompted if omitted")
+    parser.add_argument("--player-code", choices=("R", "O"), help="analysis subject; defaults to the Stage 10 report subject")
+    parser.add_argument("--r-name", "--player-name", dest="r_name", help="name assigned to Stage 3 identity R")
+    parser.add_argument("--o-name", "--opponent-name", dest="o_name", help="name assigned to Stage 3 identity O")
     parser.add_argument("--coach-narrative", type=Path, help="optional Stage 10A Markdown narrative (defaults beside report_json)")
+    parser.add_argument(
+        "--shuttle-tracks", type=Path,
+        help="Stage 3A TrackNet JSON; draw the filtered shuttle trail and Stage 10 shot counter",
+    )
+    parser.add_argument(
+        "--no-shuttle-overlay", action="store_true",
+        help="hide the shuttle trail; keep the shot counter when TrackNet data is supplied",
+    )
+    parser.add_argument(
+        "--shot-count-only", action="store_true",
+        help="show Stage 10 rally shot counts without drawing a shuttle trail; TrackNet JSON is not required",
+    )
     parser.add_argument("--pose-model", type=Path, default=Path("models/pose_landmarker_heavy.task"), help="local MediaPipe pose model")
     parser.add_argument("--voice", default="Aman", help="local macOS say voice; default Aman (en_IN)")
     parser.add_argument("--voice-rate", type=int, default=185, help="local speech rate in words per minute")
+    parser.add_argument(
+        "--sentence-pause-ms", type=int, default=600,
+        help="silence inserted between spoken sentences (default: 600 ms; 0 disables it)",
+    )
+    parser.add_argument(
+        "--longest-rally-interval-sec", type=float, default=48.0,
+        help="source-video interval between longest-rally callouts in the full-match section (default: 48 s)",
+    )
+    parser.add_argument(
+        "--longest-rally-duration-sec", type=float, default=7.0,
+        help="duration of each longest-rally callout (default: 7 s)",
+    )
     parser.add_argument("--freeze-duration", type=float, default=8.0, help="minimum seconds to hold each review frame")
     parser.add_argument(
         "--video-encoder",
