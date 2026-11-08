@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "categories": {
+    "longest_rally": true,
+    "slow_recovery": false,
+    "late_rally_speed_drop": false,
+    "ready_position": false,
+    "court_coverage_imbalance": false,
+    "mid_length_rally_loss": false,
+    "late_game_pressure_loss": false
+  },
+  "category_help": {
+    "longest_rally": "Always included when the rally has usable timestamps; may be won or lost.",
+    "slow_recovery": "A loss with more than 1.6 m remaining from base one second after an out-of-position trip begins.",
+    "late_rally_speed_drop": "A loss over 5 seconds with lower tracked average speed near the rally end than near the start.",
+    "ready_position": "A loss with a low wrist-above-shoulder racket-preparation proxy during at least three READY pose samples.",
+    "court_coverage_imbalance": "A loss whose front/back court-time shares differ from the player's winning-rally pattern.",
+    "mid_length_rally_loss": "A loss lasting more than 5 and up to 10 seconds.",
+    "late_game_pressure_loss": "A loss at 20 or higher, or at 17 or higher with a score gap of at most three."
+  }
+}

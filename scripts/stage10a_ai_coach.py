@@ -11,6 +11,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from stage11_video import REVIEW_CATEGORY_LABELS, select_coaching_reviews
+
 
 def read_json(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -19,7 +21,10 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def coach_evidence(report: dict[str, Any], player_code: str | None = None) -> dict[str, Any]:
+def coach_evidence(
+    report: dict[str, Any], player_code: str | None = None,
+    selection_path: Path | None = None,
+) -> dict[str, Any]:
     names = report.get("player_names", {})
     report_player_code = report.get("analysis_subject_code", "R")
     player_code = player_code or report_player_code
@@ -91,12 +96,19 @@ def coach_evidence(report: dict[str, Any], player_code: str | None = None) -> di
             "players": phase_players,
         })
 
+    selected_reviews, selection_source = select_coaching_reviews(
+        report, player_code,
+        {"R": str(names.get("R") or "Player R"), "O": str(names.get("O") or "Player O")},
+        selection_path,
+    )
     reviews = []
-    for row in report.get("example_lost_points", []):
+    for row in selected_reviews:
         reviews.append({
+            "category": row.get("category"),
+            "category_title": row.get("title"),
             "serve": row.get("video_serve_number"),
             "score_point": row.get("point_n"),
-            "review_type": row.get("reason_label", row.get("reason")),
+            "review_type": row.get("title"),
             "score_before": row.get("score_before"),
             "score_after": row.get("score_after"),
             "serve_time_sec": row.get("serve_t"),
@@ -112,11 +124,13 @@ def coach_evidence(report: dict[str, Any], player_code: str | None = None) -> di
             "shot_count": row.get("shot_count"),
             "shot_count_source": row.get("shot_count_source"),
             "shot_count_quality": row.get("shot_count_quality"),
+            "player_movement": row.get("movement_by_player", {}).get(player_code, {}),
+            "player_ready_pose": row.get("pose_by_context", {}).get("READY", {}),
             "player_beginning_speed_m_s": row.get("movement_phase_speed", {}).get(player_code, {}).get("beginning_average_speed_m_s"),
             "player_tail_speed_m_s": row.get("movement_phase_speed", {}).get(player_code, {}).get("tail_average_speed_m_s"),
             "player_tail_speed_change_pct": row.get("movement_phase_speed", {}).get(player_code, {}).get("tail_change_pct"),
             "player_distance_m": row.get("player_distance_m", row.get(f"{player_code}_distance_m")),
-            "stage10_observation": row.get("coach_note"),
+            "evidence_based_observation": row.get("coach_note"),
             "contact_sheets": row.get("contact_sheets", []),
         })
 
@@ -167,20 +181,25 @@ def coach_evidence(report: dict[str, Any], player_code: str | None = None) -> di
             "interpretation_note": report.get("pickup_evidence", {}).get("interpretation_note"),
         },
         "tracknet_shuttle_analysis": report.get("tracknet_shuttle_analysis", {"enabled": False}),
-        "three_video_reviews": reviews,
+        "review_selection_source": selection_source,
+        "selected_video_reviews": reviews,
         "data_quality_notes": report.get("quality_notes", {}),
     }
 
 
-def build_context(report: dict[str, Any], player_code: str | None = None) -> str:
-    evidence = coach_evidence(report, player_code)
+def build_context(
+    report: dict[str, Any], player_code: str | None = None,
+    selection_path: Path | None = None,
+    evidence: dict[str, Any] | None = None,
+) -> str:
+    evidence = evidence or coach_evidence(report, player_code, selection_path)
     player_code = evidence["analysis_subject_code"]
-    serves = [row.get("serve") for row in evidence["three_video_reviews"] if row.get("serve") is not None]
+    reviews = evidence["selected_video_reviews"]
     headings = [
         "## Match opening",
         "## Score progression",
         "## Court movement",
-        *(f"## Serve {serve}" for serve in serves),
+        *(f"## Serve {row['serve']} [{row['category']}]" for row in reviews if row.get("serve") is not None),
         "## Practice focus",
     ]
     output_rules = "\n".join(f"- {heading}" for heading in headings)
@@ -191,7 +210,7 @@ def build_context(report: dict[str, Any], player_code: str | None = None) -> str
         "",
         f"Use only the supplied evidence. Refer to the two players by name ({evidence['participants']['player']['name']} and {evidence['participants']['opponent']['name']}); do not use tracking codes such as R or O in the narrative. Treat movement, pose, pickup, rally-end, TrackNet shot-count, and shuttle estimates as clues rather than proof of cause. A TrackNet stationary-point candidate is not a confirmed landing or winner. Shot counts are estimates; image-space net-plane candidates can include projection overlap or adjacent-court tracks and should be checked against video. A lower tail speed is not proof of fatigue. Do not infer true shuttle speed or exact shot type from image coordinates. Do not invent shots or events that are not in the data. Use timestamps and serve numbers to point the player to video they can check. The score-only point is not a video serve or rally. Avoid explaining basic badminton scoring rules.",
         "",
-        "Keep the opening and each analysis section to one or two concise spoken sentences. For each reviewed serve, explain what to look for in that clip and give one practical adjustment. Finish with two or three prioritized practice focuses. Do not repeat the JSON or add generic praise.",
+        "Keep the opening and each analysis section to one or two concise spoken sentences. For every selected review, use its exact serve-and-category heading, explain what to check in that clip, and give one practical adjustment. Do not add coaching sections for unselected categories or serves. Finish with two or three prioritized practice focuses. Do not repeat the JSON or add generic praise.",
         "",
         "## Input evidence (do not reproduce this section)",
         "",
@@ -199,7 +218,7 @@ def build_context(report: dict[str, Any], player_code: str | None = None) -> str
         json.dumps(evidence, ensure_ascii=False, indent=2),
         "```",
         "",
-        f"Return only the coaching narrative as Markdown. Start with this exact metadata line: `<!-- analysis_subject_code: {player_code} -->`. Use these exact headings, including one for each reviewed serve:",
+        f"Return only the coaching narrative as Markdown. Start with this exact metadata line: `<!-- analysis_subject_code: {player_code} -->`. Use these exact headings, including one for each selected review:",
         output_rules,
         "",
     ])
@@ -240,6 +259,10 @@ def main() -> int:
     parser.add_argument("--mode", choices=("context", "ollama"), default="context", help="export a copy/paste prompt or call local Ollama")
     parser.add_argument("--context-output", type=Path, help="self-contained prompt and evidence file (defaults beside report_json)")
     parser.add_argument("--narrative-output", type=Path, help="Markdown narrative consumed by Stage 11 (defaults beside report_json)")
+    parser.add_argument(
+        "--review-selection-json", type=Path,
+        help="optional category choices shared with Stage 11; otherwise Stage 10A writes a video-specific resolved selection",
+    )
     parser.add_argument("--ollama-url", default="http://localhost:11434/api/chat", help="local Ollama chat endpoint")
     parser.add_argument("--model", default="qwen2.5:7b", help="installed local Ollama model name")
     parser.add_argument("--timeout", type=float, default=600.0, help="Ollama request timeout in seconds")
@@ -254,17 +277,44 @@ def main() -> int:
         subject_code = args.player_code or report.get("analysis_subject_code", "R")
         if subject_code not in ("R", "O"):
             raise ValueError("report analysis_subject_code must be R or O")
-        context = build_context(report, subject_code)
         suffix = "" if subject_code == "R" else "-O"
+        selection_path = args.review_selection_json.expanduser() if args.review_selection_json else None
+        default_selection_path = report_path.parent / "coach_review_selection.json"
+        if selection_path is None and default_selection_path.is_file():
+            selection_path = default_selection_path
+        evidence = coach_evidence(report, subject_code, selection_path)
+        context = build_context(report, subject_code, evidence=evidence)
         context_output = (
             args.context_output or report_path.parent / f"AI-coach-context{suffix}.md"
         ).expanduser()
         narrative_output = (
             args.narrative_output or report_path.parent / f"AI-coach-narrative{suffix}.md"
         ).expanduser()
+        selection_output = report_path.parent / f"coach_review_selection.resolved{suffix}.json"
+        if selection_path is not None and selection_path.resolve() == selection_output.resolve():
+            raise ValueError("review selection input cannot also be the resolved selection output")
+        selected_reviews = evidence["selected_video_reviews"]
+        selected_categories = {row["category"] for row in selected_reviews}
+        resolved_selection = {
+            "version": 1,
+            "analysis_subject_code": subject_code,
+            "selection_source": evidence["review_selection_source"],
+            "categories": {
+                category: category in selected_categories
+                for category in REVIEW_CATEGORY_LABELS
+            },
+            "selected_reviews": [
+                {
+                    "category": row["category"],
+                    "point_n": row["score_point"],
+                    "video_serve_number": row["serve"],
+                }
+                for row in selected_reviews
+            ],
+        }
         context_output.parent.mkdir(parents=True, exist_ok=True)
         narrative_output.parent.mkdir(parents=True, exist_ok=True)
-        outputs = [context_output]
+        outputs = [context_output, selection_output]
         if args.mode == "ollama":
             outputs.append(narrative_output)
         existing = [path for path in outputs if path.exists()]
@@ -273,7 +323,12 @@ def main() -> int:
             raise ValueError(f"output already exists: {names}; add --overwrite to replace it")
 
         context_output.write_text(context, encoding="utf-8")
+        selection_output.write_text(json.dumps(resolved_selection, indent=2) + "\n", encoding="utf-8")
         print(f"Coach context: {context_output}")
+        print(f"Resolved review selection: {selection_output}")
+        print(f"Selected {len(selected_reviews)} category-matched review(s): " + ", ".join(
+            f"{row['category']} (serve {row['serve']})" for row in selected_reviews
+        ))
         if args.mode == "ollama":
             try:
                 narrative = ask_ollama(args.ollama_url, args.model, context, args.timeout)

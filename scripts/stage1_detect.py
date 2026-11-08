@@ -395,7 +395,7 @@ def main() -> int:
             if sample_count % 1000 == 0:
                 elapsed = time.monotonic() - start_time
                 print(
-                    f"Processed {sample_count} sampled frames; "
+                    f"Processed {sample_count}/{estimated_sampled_frames} sampled frames; "
                     f"{total_detections} person boxes so far; elapsed {elapsed:.0f}s.",
                     flush=True,
                 )

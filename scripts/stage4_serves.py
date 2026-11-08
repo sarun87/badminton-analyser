@@ -979,15 +979,19 @@ def main() -> int:
         player: position_speeds(player_positions[player], timestamps)
         for player in ("R", "O")
     }
-    mask = [
-        in_serve_area(
-            {player: player_positions[player][i] for player in ("R", "O")},
-            {player: player_speeds[player][i] for player in ("R", "O")},
-            near_still_speed_m_s,
-            far_still_speed_m_s,
+    mask = []
+    for frame_index in range(len(frames)):
+        mask.append(
+            in_serve_area(
+                {player: player_positions[player][frame_index] for player in ("R", "O")},
+                {player: player_speeds[player][frame_index] for player in ("R", "O")},
+                near_still_speed_m_s,
+                far_still_speed_m_s,
+            )
         )
-        for i in range(len(frames))
-    ]
+        processed = frame_index + 1
+        if processed % 500 == 0 or processed == len(frames):
+            print(f"Serve detection frames processed: {processed}/{len(frames)}", flush=True)
     groups = find_and_merge_windows(
         mask,
         timestamps,

@@ -424,7 +424,7 @@ def analyze(
         all_expected_heights[player] = expected
 
     results: list[dict[str, Any]] = []
-    for point in points:
+    for point_index, point in enumerate(points, start=1):
         rally_end = float(point["rally_end_sec"])
         next_serve = point.get("next_serve_t")
         window_start = rally_end
@@ -514,6 +514,7 @@ def analyze(
             "review_frame_index": int(review_index),
         }
         results.append(result)
+        print(f"Pickup points processed: {point_index}/{len(points)}", flush=True)
 
     method = {
         "description": (

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import hashlib
 import json
 import math
+import random
 import re
 import shutil
 import subprocess
@@ -29,6 +31,15 @@ COURT_L = 13.4
 COLORS = {"R": (60, 240, 210), "O": (50, 160, 255)}  # BGR: teal and orange
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 DISPLAY_TRANSLATION = str.maketrans({"·": "|", "–": "-", "—": "-", "→": "->", "≤": "<=", "≥": ">=", "’": "'"})
+REVIEW_CATEGORY_LABELS = {
+    "longest_rally": "LONGEST RALLY",
+    "slow_recovery": "SLOW RECOVERY AFTER MOVEMENT",
+    "late_rally_speed_drop": "LATE-RALLY MOVEMENT DROP",
+    "ready_position": "READY-POSITION HABIT",
+    "court_coverage_imbalance": "COURT-COVERAGE IMBALANCE",
+    "mid_length_rally_loss": "MID-LENGTH RALLY LOSS",
+    "late_game_pressure_loss": "LATE-GAME PRESSURE LOSS",
+}
 
 
 def finite(value: Any) -> bool:
@@ -844,31 +855,371 @@ def draw_review_banner(frame: np.ndarray, example: dict[str, Any], index: int, t
     )
 
 
-def highlight_examples(report: dict[str, Any], player_code: str | None = None) -> list[dict[str, Any]]:
-    report_code = report.get("analysis_subject_code", "R")
-    player_code = player_code or report_code
-    if player_code not in ("R", "O"):
-        raise ValueError("analysis player code must be R or O")
-    if player_code != report_code:
-        raise ValueError(f"report data is prepared for {report_code}, not {player_code}")
-    examples = report.get("example_lost_points", [])
-    wanted = (
-        ("representative short", "SHORT RALLY LOSS"),
-        (f"longest {player_code} loss", "LONG RALLY LOSS"),
-        (f"highest {player_code} movement", "HIGHEST TRACKED MOVEMENT"),
-    )
-    selected = []
-    for prefix, title in wanted:
-        match = next((row for row in examples if str(row.get("reason", "")).startswith(prefix)), None)
+def parse_score_pair(value: Any, score_order: str) -> tuple[int, int] | None:
+    if isinstance(value, dict) and finite(value.get("R")) and finite(value.get("O")):
+        return int(value["R"]), int(value["O"])
+    if isinstance(value, str):
+        match = re.fullmatch(r"\s*(\d+)\s*[-–—:]\s*(\d+)\s*", value)
         if match:
-            selected.append({**match, "title": title})
-    return selected
+            first, second = int(match.group(1)), int(match.group(2))
+            return (first, second) if score_order == "R-O" else (second, first)
+    return None
+
+
+def select_coaching_reviews(
+    report: dict[str, Any], player_code: str, names: dict[str, str],
+    selection_path: Path | None, pose_frames: list[dict[str, Any]] | None = None,
+) -> tuple[list[dict[str, Any]], str]:
+    report_code = report.get("analysis_subject_code", "R")
+    if player_code not in ("R", "O") or report_code != player_code:
+        raise ValueError(f"review selection requires report data prepared for {player_code}")
+    points = [
+        row for row in report.get("video_points", [])
+        if isinstance(row, dict) and finite(row.get("serve_t")) and finite(row.get("rally_end_sec"))
+    ]
+    if not points:
+        return [], "no timestamped video rallies were available"
+    losses = [row for row in points if row.get("outcome") == "lost"]
+    wins = [row for row in points if row.get("outcome") == "won"]
+    candidates: dict[str, list[dict[str, Any]]] = {key: [] for key in REVIEW_CATEGORY_LABELS}
+    player_name = names[player_code]
+
+    def add_candidate(
+        category: str, row: dict[str, Any], coach_note: str, highlight_t: float | None = None,
+    ) -> None:
+        item = {
+            **row,
+            "category": category,
+            "title": REVIEW_CATEGORY_LABELS[category],
+            "coach_note": coach_note,
+        }
+        if finite(highlight_t):
+            item["highlight_t"] = min(
+                float(row["rally_end_sec"]),
+                max(float(row["serve_t"]), float(highlight_t)),
+            )
+        candidates[category].append(item)
+
+    # The longest playable rally is included even if it was won. It is useful as
+    # a match reference, and does not imply that the rally exposed a fault.
+    longest = max(
+        points,
+        key=lambda row: (float(row.get("rally_duration_sec") or (row["rally_end_sec"] - row["serve_t"])), -int(row["point_n"])),
+    )
+    longest_duration = float(longest.get("rally_duration_sec") or (longest["rally_end_sec"] - longest["serve_t"]))
+    longest_outcome = "won" if longest.get("outcome") == "won" else "lost"
+    longest_note = (
+        f"This was the longest rally at about {longest_duration:.1f} seconds, and {player_name} won it. "
+        "Review the movement and recovery that helped sustain the exchange."
+        if longest_outcome == "won" else
+        f"This was the longest rally at about {longest_duration:.1f} seconds, and {player_name} lost it. "
+        "Review the final movement and recovery without assuming the last position caused the result."
+    )
+    add_candidate("longest_rally", longest, longest_note, float(longest["serve_t"]) + 0.6 * longest_duration)
+
+    # Recovery: use the most pronounced recorded distance from base one second
+    # after an out-of-position trip begins, and show that sample in the clip.
+    recovery_rows = []
+    for row in losses:
+        movement = row.get("movement_by_player", {}).get(player_code, {})
+        trips = movement.get("out_of_position_trips", []) if isinstance(movement, dict) else []
+        valid_trips = [
+            trip for trip in trips
+            if isinstance(trip, dict)
+            and finite(trip.get("distance_from_base_1s_later_m"))
+            and float(trip["distance_from_base_1s_later_m"]) > 1.6
+        ]
+        if valid_trips:
+            trip = max(valid_trips, key=lambda item: item["distance_from_base_1s_later_m"])
+            recovery_rows.append((float(trip["distance_from_base_1s_later_m"]), row, trip))
+    for distance, row, trip in sorted(recovery_rows, key=lambda item: item[0], reverse=True):
+        trip_start = float(trip["start_t"]) if finite(trip.get("start_t")) else float(row["serve_t"])
+        add_candidate(
+            "slow_recovery", row,
+            f"Tracking placed {player_name} {distance:.1f} m from the base point one second after an out-of-position trip began in this loss. "
+            "Check whether you recovered toward base and raised the racket before the next opponent contact; the position estimate is approximate.",
+            trip_start + 1.0,
+        )
+
+    # A within-rally speed reduction is only a descriptive cue, not a fatigue diagnosis.
+    speed_rows = []
+    for row in losses:
+        phase = row.get("movement_phase_speed", {}).get(player_code, {})
+        change = phase.get("tail_minus_beginning_m_s") if isinstance(phase, dict) else None
+        if (
+            finite(change) and float(change) < 0
+            and phase.get("comparison_status") == "available"
+            and finite(row.get("rally_duration_sec")) and float(row["rally_duration_sec"]) > 5.0
+        ):
+            speed_rows.append((float(change), row, phase))
+    for change, row, phase in sorted(speed_rows, key=lambda item: item[0]):
+        beginning = float(phase["beginning_average_speed_m_s"])
+        tail = float(phase["tail_average_speed_m_s"])
+        window = float(phase.get("window_sec", 0.0))
+        add_candidate(
+            "late_rally_speed_drop", row,
+            f"Tracked average speed changed from {beginning:.2f} m/s near the start to {tail:.2f} m/s near the end of this loss. "
+            "Review the late-rally footwork and recovery, and check the video for pauses or tracking gaps before treating the change as meaningful.",
+            float(row["rally_end_sec"]) - max(0.0, window / 2.0),
+        )
+
+    # Pose summaries are per rally and context. At least three READY samples
+    # reduce the chance that one obscured frame determines the review.
+    winning_ready_shares = [
+        float(ready["racket_arm_up_share"])
+        for row in wins
+        for ready in [row.get("pose_by_context", {}).get("READY", {})]
+        if isinstance(ready, dict)
+        and finite(ready.get("racket_arm_up_share"))
+        and int(ready.get("pose_frame_count", 0) or 0) >= 3
+    ]
+    winning_ready_reference = (
+        sum(winning_ready_shares) / len(winning_ready_shares) if winning_ready_shares else None
+    )
+    ready_threshold = max(0.0, winning_ready_reference - 0.1) if winning_ready_reference is not None else 0.5
+    ready_rows = []
+    for row in losses:
+        ready = row.get("pose_by_context", {}).get("READY", {})
+        share = ready.get("racket_arm_up_share") if isinstance(ready, dict) else None
+        count = ready.get("pose_frame_count", 0) if isinstance(ready, dict) else 0
+        if finite(share) and float(share) < ready_threshold and int(count or 0) >= 3:
+            ready_rows.append((float(share), row, ready))
+    pose_by_point: dict[int, list[dict[str, Any]]] = {}
+    for sample in pose_frames or []:
+        point_n = sample.get("point_n")
+        if isinstance(point_n, int) and sample.get("context") == "READY":
+            pose_by_point.setdefault(point_n, []).append(sample)
+    for share, row, ready in sorted(ready_rows, key=lambda item: item[0]):
+        count = int(ready.get("pose_frame_count", 0))
+        highlight = next((
+            sample for sample in pose_by_point.get(int(row["point_n"]), [])
+            if sample.get("racket_arm_up") is False and finite(sample.get("t"))
+        ), None)
+        crouch = ready.get("median_crouch_pct_vs_upright")
+        stance = ready.get("median_stance_width_ratio")
+        details = []
+        if finite(crouch):
+            details.append(f"median crouch estimate {float(crouch):.0f}%")
+        if finite(stance):
+            details.append(f"stance-width ratio {float(stance):.2f}")
+        detail_text = f" Other READY measures: {', '.join(details)}." if details else ""
+        reference_text = (
+            f" Won rallies averaged {winning_ready_reference:.0%} racket-arm-up share."
+            if winning_ready_reference is not None else ""
+        )
+        add_candidate(
+            "ready_position", row,
+            f"The wrist-above-shoulder racket-preparation proxy was present in {share:.0%} of {count} usable READY pose samples in this loss.{reference_text}{detail_text} "
+            "Check racket preparation while waiting; pose estimates can be obscured by camera angle and overlap.",
+            float(highlight["t"]) if highlight else None,
+        )
+
+    # Compare front/back court time in each loss to the player's own winning-rally
+    # pattern. Require a visible difference so an ordinary rally is not sold as a fault.
+    def coverage(row: dict[str, Any]) -> tuple[float, float] | None:
+        movement = row.get("movement_by_player", {}).get(player_code, {})
+        if not isinstance(movement, dict):
+            return None
+        front, back = movement.get("front_court_time_share"), movement.get("back_court_time_share")
+        return (float(front), float(back)) if finite(front) and finite(back) else None
+
+    winning_coverage = [value for row in wins if (value := coverage(row)) is not None]
+    if winning_coverage:
+        reference = tuple(sum(value[index] for value in winning_coverage) / len(winning_coverage) for index in (0, 1))
+    else:
+        reference = None
+    coverage_rows = []
+    for row in losses:
+        value = coverage(row)
+        if value is None:
+            continue
+        if reference is None:
+            deviation = abs(value[0] - value[1])
+            threshold = 0.2
+        else:
+            deviation = math.dist(value, reference)
+            threshold = 0.1
+        if deviation >= threshold:
+            coverage_rows.append((deviation, row, value))
+    for deviation, row, value in sorted(coverage_rows, key=lambda item: item[0], reverse=True):
+        if reference is None:
+            comparison = "There was no usable won-rally baseline, so treat this as a court-coverage prompt only."
+        else:
+            comparison = (
+                f"In your won rallies, the tracked averages were {reference[0]:.0%} front court and {reference[1]:.0%} back court."
+            )
+        add_candidate(
+            "court_coverage_imbalance", row,
+            f"In this loss, tracked court time was {value[0]:.0%} front court and {value[1]:.0%} back court. {comparison} "
+            "Review whether the position came from opponent pressure and whether the next recovery restored court balance.",
+            (float(row["serve_t"]) + float(row["rally_end_sec"])) / 2.0,
+        )
+
+    mid_rows = [
+        row for row in losses
+        if finite(row.get("rally_duration_sec")) and 5.0 < float(row["rally_duration_sec"]) <= 10.0
+    ]
+    confidence_rank = {"high": 2, "medium": 1, "low": 0}
+    for row in sorted(
+        mid_rows,
+        key=lambda item: (
+            -confidence_rank.get(str(item.get("rally_end_confidence", "")), 0),
+            abs(float(item["rally_duration_sec"]) - 7.5),
+        ),
+    ):
+        duration = float(row["rally_duration_sec"])
+        add_candidate(
+            "mid_length_rally_loss", row,
+            f"This loss lasted about {duration:.1f} seconds, in the middle-length rally band. Review the positioning changes and recovery through the exchange; the tracking does not identify each shot type.",
+            (float(row["serve_t"]) + float(row["rally_end_sec"])) / 2.0,
+        )
+
+    score_order = str(report.get("score", {}).get("score_order", "R-O"))
+    pressure_rows = []
+    for row in losses:
+        score = parse_score_pair(row.get("score_before"), score_order)
+        if score is None:
+            continue
+        own, opponent = score if player_code == "R" else (score[1], score[0])
+        highest, margin = max(own, opponent), abs(own - opponent)
+        if highest >= 20 or (highest >= 17 and margin <= 3):
+            pressure_rows.append(((highest >= 20, highest, -margin), row, own, opponent))
+    for _, row, own, opponent in sorted(pressure_rows, key=lambda item: item[0], reverse=True):
+        before = row.get("score_before", "unknown score")
+        after = row.get("score_after", "unknown score")
+        add_candidate(
+            "late_game_pressure_loss", row,
+            f"This loss came at a late-game score ({before}, then {after}). Review the decision and recovery in the clip; the score alone does not explain the point.",
+            float(row["rally_end_sec"]),
+        )
+
+    if selection_path is not None:
+        config = read_json(selection_path.expanduser())
+        config_subject = config.get("analysis_subject_code")
+        if config_subject is not None and config_subject != player_code:
+            raise ValueError(
+                f"review selection file is for {config_subject}; use a {player_code} selection or omit the file"
+            )
+        selected_flags = config.get("categories")
+        if not isinstance(selected_flags, dict):
+            raise ValueError("review selection JSON needs a 'categories' object containing true/false choices")
+        unknown = set(selected_flags) - set(REVIEW_CATEGORY_LABELS)
+        if unknown:
+            raise ValueError(f"unknown review categories: {', '.join(sorted(unknown))}")
+        if any(not isinstance(value, bool) for value in selected_flags.values()):
+            raise ValueError("every review category choice must be true or false")
+        selected_categories = [key for key in REVIEW_CATEGORY_LABELS if selected_flags.get(key, False)]
+        resolved_reviews = config.get("selected_reviews")
+        if resolved_reviews is not None:
+            if not isinstance(resolved_reviews, list):
+                raise ValueError("resolved review selection 'selected_reviews' must be a list")
+            for item in resolved_reviews:
+                if (
+                    not isinstance(item, dict)
+                    or item.get("category") not in REVIEW_CATEGORY_LABELS
+                    or not isinstance(item.get("point_n"), int)
+                    or isinstance(item.get("point_n"), bool)
+                ):
+                    raise ValueError("each resolved review must contain a supported category and integer point_n")
+        if selected_flags.get("longest_rally") is False:
+            print("The longest rally is always included when a playable timestamp is available.", flush=True)
+        source = str(config.get("selection_source") or f"user selection from {selection_path.expanduser()}")
+    else:
+        available = [key for key in REVIEW_CATEGORY_LABELS if key != "longest_rally" and candidates[key]]
+        video_signature = [
+            [row.get("point_n"), row.get("serve_t"), row.get("rally_end_sec"), row.get("winner")]
+            for row in points
+        ]
+        seed_text = json.dumps(
+            {
+                "subject": player_code,
+                "final": report.get("score", {}).get("final"),
+                "video_points": video_signature,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        seed = int.from_bytes(hashlib.sha256(seed_text.encode("utf-8")).digest()[:8], "big")
+        chooser = random.Random(seed)
+        target_count = chooser.choice((3, 4))
+        chooser.shuffle(available)
+        slots = max(0, target_count - (1 if candidates["longest_rally"] else 0))
+        selected_categories = available[:slots]
+        source = f"automatic video-specific selection (target {target_count} reviews)"
+
+    selected: list[dict[str, Any]] = []
+    used_points: set[int] = set()
+    if candidates["longest_rally"]:
+        item = max(
+            candidates["longest_rally"],
+            key=lambda row: (float(row.get("rally_duration_sec") or 0.0), -int(row["point_n"])),
+        )
+        selected.append(item)
+        used_points.add(int(item["point_n"]))
+    resolved_reviews = config.get("selected_reviews") if selection_path is not None else None
+    if isinstance(resolved_reviews, list):
+        for requested in resolved_reviews:
+            category, point_n = requested["category"], requested["point_n"]
+            if category == "longest_rally" and candidates["longest_rally"]:
+                continue
+            item = next((
+                row for row in candidates[category]
+                if int(row["point_n"]) == point_n and point_n not in used_points
+            ), None)
+            if item is not None:
+                selected.append(item)
+                used_points.add(point_n)
+    else:
+        for category in selected_categories:
+            if category == "longest_rally":
+                continue
+            item = next((row for row in candidates[category] if int(row["point_n"]) not in used_points), None)
+            if item is not None:
+                selected.append(item)
+                used_points.add(int(item["point_n"]))
+    if selection_path is None and len(selected) < target_count:
+        for category in [key for key in REVIEW_CATEGORY_LABELS if key not in selected_categories and key != "longest_rally"]:
+            item = next((row for row in candidates[category] if int(row["point_n"]) not in used_points), None)
+            if item is not None:
+                selected.append(item)
+                used_points.add(int(item["point_n"]))
+            if len(selected) >= target_count:
+                break
+        if len(selected) < target_count:
+            print(
+                f"Only {len(selected)} distinct eligible rally reviews were available (target was {target_count}).",
+                flush=True,
+            )
+    if selection_path is not None and not isinstance(resolved_reviews, list):
+        included = {row["category"] for row in selected}
+        skipped = [category for category in selected_categories if category not in included]
+        if skipped:
+            print(
+                "Requested review categories without an eligible distinct rally: "
+                + ", ".join(skipped), flush=True,
+            )
+    elif isinstance(resolved_reviews, list):
+        included_reviews = {(row["category"], int(row["point_n"])) for row in selected}
+        missing_reviews = [
+            f"{row['category']} point {row['point_n']}"
+            for row in resolved_reviews
+            if (row["category"], row["point_n"]) not in included_reviews
+        ]
+        if missing_reviews:
+            raise ValueError(
+                "resolved Stage 10A review selection no longer matches this Stage 10 report: "
+                + ", ".join(missing_reviews)
+                + ". Rerun Stage 10A after updating the report, then rerun Stage 11."
+            )
+    return selected, source
 
 
 def highlight_frame_time(
     example: dict[str, Any], track_frames: list[dict[str, Any]], track_times: list[float],
     player_code: str = "R",
 ) -> float:
+    if finite(example.get("highlight_t")):
+        return float(example["highlight_t"])
     if example["title"] != "HIGHEST TRACKED MOVEMENT":
         return float(example["rally_end_sec"])
     start, end = float(example["serve_t"]), float(example["rally_end_sec"])
@@ -889,12 +1240,12 @@ def read_coach_narrative(path: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     content = path.read_text(encoding="utf-8")
-    sections: dict[str, Any] = {"serves": {}}
+    sections: dict[str, Any] = {"reviews": {}}
     subject = re.search(r"<!--\s*analysis_subject_code:\s*([RO])\s*-->", content, re.IGNORECASE)
     if subject:
         sections["analysis_subject_code"] = subject.group(1).upper()
-    buffers: dict[tuple[str, int | None], list[str]] = {}
-    current: tuple[str, int | None] | None = None
+    buffers: dict[tuple[str, int | None, str | None], list[str]] = {}
+    current: tuple[str, int | None, str | None] | None = None
     recognized_heading = False
     for line in content.splitlines():
         heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
@@ -902,15 +1253,26 @@ def read_coach_narrative(path: Path) -> dict[str, Any]:
             title = heading.group(1).strip().lower()
             serve_match = re.search(r"\bserve\s+(\d+)\b", title)
             if serve_match:
-                current = ("serve", int(serve_match.group(1)))
+                category_match = re.search(r"\[([a-z_]+)\]", title)
+                category = category_match.group(1) if category_match else None
+                if category is None:
+                    normalized_title = re.sub(r"[^a-z0-9]+", "_", title)
+                    category = next((
+                        key for key, label in REVIEW_CATEGORY_LABELS.items()
+                        if re.sub(r"[^a-z0-9]+", "_", label.lower()) in normalized_title
+                    ), None)
+                if category in REVIEW_CATEGORY_LABELS:
+                    current = ("review", int(serve_match.group(1)), category)
+                else:
+                    current = None
             elif "opening" in title or "overview" in title:
-                current = ("opening", None)
+                current = ("opening", None, None)
             elif "score" in title or "momentum" in title:
-                current = ("score", None)
+                current = ("score", None, None)
             elif "movement" in title or "heatmap" in title or "court" in title:
-                current = ("movement", None)
+                current = ("movement", None, None)
             elif "practice" in title or "closing" in title or "priority" in title or "takeaway" in title:
-                current = ("closing", None)
+                current = ("closing", None, None)
             else:
                 current = None
             if current is not None:
@@ -931,12 +1293,12 @@ def read_coach_narrative(path: Path) -> dict[str, Any]:
                 output.append(line)
         return " ".join(output).strip()
 
-    for (section, serve_number), lines in buffers.items():
+    for (section, serve_number, category), lines in buffers.items():
         value = plain_text(lines)
         if not value:
             continue
-        if section == "serve" and serve_number is not None:
-            sections["serves"][serve_number] = value
+        if section == "review" and serve_number is not None and category is not None:
+            sections["reviews"].setdefault(serve_number, {})[category] = value
         else:
             sections[section] = value
     if not recognized_heading:
@@ -946,8 +1308,8 @@ def read_coach_narrative(path: Path) -> dict[str, Any]:
 
 def review_coach_note(event: dict[str, Any], coach_sections: dict[str, Any]) -> str:
     serve_number = event.get("video_serve_number", event.get("point_n"))
-    narrative_reviews = coach_sections.get("serves", {})
-    ai_note = narrative_reviews.get(serve_number)
+    narrative_reviews = coach_sections.get("reviews", {})
+    ai_note = narrative_reviews.get(serve_number, {}).get(event.get("category"))
     if isinstance(ai_note, str) and ai_note.strip():
         return ai_note.strip()
     return str(event.get("coach_note") or "Review the exchange and check the final recovery before drawing a conclusion.")
@@ -1152,6 +1514,12 @@ def render(args: argparse.Namespace) -> None:
     rallies_data = read_json(args.rallies_json)
     pose_data = read_json(args.pose_json)
     report = read_json(args.report_json)
+    if report.get("review_evidence_version", 0) < 1:
+        print(
+            "This Stage 10 report predates per-rally movement/pose review evidence; "
+            "rerun Stage 10 to enable all review categories.",
+            flush=True,
+        )
     report_player_code = report.get("analysis_subject_code", "R")
     player_code = args.player_code or report_player_code
     if player_code not in ("R", "O") or report_player_code not in ("R", "O"):
@@ -1181,7 +1549,7 @@ def render(args: argparse.Namespace) -> None:
     if coach_sections:
         print(f"AI coach narrative loaded: {coach_narrative_path}", flush=True)
     else:
-        print("No AI coach narrative found; using Stage 10 coaching notes.", flush=True)
+        print("No AI coach narrative found; using evidence-based review notes.", flush=True)
     report_names = report.get("player_names", {})
     r_name = (args.r_name or report_names.get("R") or "").strip()
     o_name = (args.o_name or report_names.get("O") or "").strip()
@@ -1190,6 +1558,15 @@ def render(args: argparse.Namespace) -> None:
     if not o_name:
         o_name = input("Name assigned to Stage 3 identity O: ").strip() or "Player O"
     names = {"R": r_name, "O": o_name}
+    review_selection_path = args.review_selection_json
+    if review_selection_path is None:
+        resolved_suffix = "" if player_code == "R" else "-O"
+        resolved_path = args.report_json.parent / f"coach_review_selection.resolved{resolved_suffix}.json"
+        input_path = args.report_json.parent / "coach_review_selection.json"
+        if resolved_path.is_file():
+            review_selection_path = resolved_path
+        elif input_path.is_file():
+            review_selection_path = input_path
     track_frames = players.get("frames")
     points = rallies_data.get("points")
     if not isinstance(track_frames, list) or not track_frames or not isinstance(points, list):
@@ -1209,9 +1586,29 @@ def render(args: argparse.Namespace) -> None:
             "shot_count_quality", "shot_count_candidate_crossings",
         )})
     points = sorted((row for row in points if finite(row.get("serve_t")) and finite(row.get("rally_end_sec"))), key=lambda row: float(row["serve_t"]))
-    examples = highlight_examples(report, player_code)
+    examples, review_selection_source = select_coaching_reviews(
+        report, player_code, names, review_selection_path,
+        pose_data.get("frames", []) if isinstance(pose_data.get("frames"), list) else [],
+    )
     if not examples:
-        raise ValueError(f"report data has no timestamped lost-point examples for {player_code}; regenerate Stage 10")
+        raise ValueError("no playable timestamped coaching-review candidates were available; rerun Stages 6 and 10")
+    print(f"Coaching review selection: {review_selection_source}.", flush=True)
+    ai_review_notes = coach_sections.get("reviews", {})
+    matched_ai_notes = sum(
+        isinstance(ai_review_notes.get(example.get("video_serve_number", example["point_n"]), {}).get(example["category"]), str)
+        for example in examples
+    )
+    print(
+        f"Category-matched AI review notes: {matched_ai_notes}/{len(examples)}; "
+        "unmatched reviews use their evidence-based category note.",
+        flush=True,
+    )
+    for index, example in enumerate(examples, start=1):
+        print(
+            f"  {index}. {example['title']}: serve {example.get('video_serve_number', example['point_n'])}, "
+            f"{example.get('rally_duration_sec', '?')} s",
+            flush=True,
+        )
     for example in examples:
         if not finite(example.get("serve_t")) or not finite(example.get("rally_end_sec")):
             raise ValueError(f"Stage 10 review at score point {example.get('point_n', '?')} needs serve and rally-end timestamps")
@@ -1241,7 +1638,9 @@ def render(args: argparse.Namespace) -> None:
         validate_shuttle_video(shuttle_data, args.video.resolve())
     shuttle_rows = shuttle_data.get("frames", []) if shuttle_data else []
     shuttle_times = shuttle_data.get("_times", []) if shuttle_data else []
-    shot_counter_enabled = bool(shuttle_data or args.shot_count_only)
+    if args.shot_count_only and args.no_shot_count:
+        raise ValueError("--shot-count-only and --no-shot-count cannot be used together")
+    shot_counter_enabled = bool(shuttle_data or args.shot_count_only) and not args.no_shot_count
     shot_count_available = any(
         isinstance(row, dict) and finite(row.get("shot_count"))
         for row in report.get("video_points", [])
@@ -1305,6 +1704,7 @@ def render(args: argparse.Namespace) -> None:
                     if media_duration(path) < 0.1:
                         raise RuntimeError(f"the local voice '{args.voice}' produced an empty audio file")
                     voice_files.append(path)
+                    print(f"Coach voice segments prepared: {i + 1}/{len(voice_texts)}", flush=True)
             except (OSError, RuntimeError, subprocess.CalledProcessError) as exc:
                 print(f"Local voice-over unavailable ({exc}); using on-screen coach captions and match audio.", flush=True)
                 voice_files = []
@@ -1317,6 +1717,43 @@ def render(args: argparse.Namespace) -> None:
         freeze_duration = max(4.0, float(args.freeze_duration))
         if voice_enabled and len(voice_lengths) > 2:
             freeze_duration = max(freeze_duration, max(voice_lengths[2:]) + 0.8)
+        heat_phases = list(heatmap_phases)
+        opening_slide_frames = round(opening_slide_duration * fps)
+        score_intro_frames = max(1, round(intro_duration * fps))
+        heatmap_phase_frames = max(
+            1, round(heatmap_duration * fps / max(1, len(heat_phases)))
+        )
+        section_slide_frames = round(section_slide_duration * fps)
+        freeze_frames = round(freeze_duration * fps)
+        review_clip_frames = 0
+        for example in examples:
+            clip_start = max(0.0, float(example["serve_t"]) - 0.4)
+            clip_end = min(duration, float(example["rally_end_sec"]) + 0.35)
+            if clip_end <= clip_start:
+                raise ValueError(
+                    f"review serve {example.get('video_serve_number', example['point_n'])} has no playable video interval"
+                )
+            clip_start_frame = min(frame_count - 1, max(0, round(clip_start * fps)))
+            clip_end_frame = min(
+                frame_count - 1, max(clip_start_frame, round(clip_end * fps))
+            )
+            review_clip_frames += clip_end_frame - clip_start_frame + 1
+        planned_render_frames = (
+            opening_slide_frames
+            + score_intro_frames
+            + len(heat_phases) * heatmap_phase_frames
+            + section_slide_frames
+            + len(examples) * freeze_frames
+            + review_clip_frames
+            + (0 if args.short_mode else section_slide_frames + frame_count)
+        )
+        planned_render_frames = max(1, planned_render_frames)
+        render_progress_interval = max(1, planned_render_frames // 100)
+        print(
+            f"Stage 11 render plan: {planned_render_frames} output frames; "
+            f"{len(examples)} coaching replay(s){' with full match' if not args.short_mode else ' in short mode'}.",
+            flush=True,
+        )
         # Narration starts with the score graph, after the opening title card.
         voice_starts: list[float] = (
             [opening_slide_duration, opening_slide_duration + intro_duration]
@@ -1352,6 +1789,11 @@ def render(args: argparse.Namespace) -> None:
             nonlocal written_frames
             encoder.stdin.write(image.tobytes())
             written_frames += 1
+            if written_frames % render_progress_interval == 0:
+                print(
+                    f"Stage 11 render frames: {written_frames}/{planned_render_frames}",
+                    flush=True,
+                )
 
         def draw_annotated(
             image: np.ndarray, timestamp: float, histories: dict[str, deque],
@@ -1392,6 +1834,7 @@ def render(args: argparse.Namespace) -> None:
             return written_frames / fps
 
         try:
+            print("Stage 11 preparation complete; rendering analysis sections.", flush=True)
             final_score = report.get("score", {}).get("final")
             opening_slide = draw_opening_title_slide(width, height, names, final_score)
             for _ in range(round(opening_slide_duration * fps)):
@@ -1406,8 +1849,7 @@ def render(args: argparse.Namespace) -> None:
                 )
                 write_frame(image)
 
-            heat_phases = list(heatmap_phases)
-            phase_frames = max(1, round(heatmap_duration * fps / max(1, len(heat_phases))))
+            phase_frames = heatmap_phase_frames
             for phase_index, phase in enumerate(heat_phases):
                 for _ in range(phase_frames):
                     image = np.full((height, width, 3), (27, 25, 19), dtype=np.uint8)
@@ -1419,7 +1861,8 @@ def render(args: argparse.Namespace) -> None:
                     write_frame(image)
 
             coaching_slide = draw_section_title_slide(
-                width, height, "Coaching", "Three in-depth rally reviews",
+                width, height, "Coaching",
+                f"{len(examples)} in-depth rally {'review' if len(examples) == 1 else 'reviews'}",
             )
             for _ in range(round(section_slide_duration * fps)):
                 write_frame(coaching_slide)
@@ -1527,8 +1970,6 @@ def render(args: argparse.Namespace) -> None:
                         )
                         write_frame(image)
                         frame_index += 1
-                        if frame_index % 3000 == 0:
-                            print(f"Full match frames rendered: {frame_index}/{frame_count}", flush=True)
                 finally:
                     video.release()
                 if frame_index == 0:
@@ -1551,11 +1992,13 @@ def render(args: argparse.Namespace) -> None:
             if encoder.poll() is None:
                 encoder.kill()
 
+        print("Stage 11 audio mux started.", flush=True)
         attach_audio(
             silent_video, args.video, voice_files,
             voice_starts if voice_enabled else [], source_audio_segments,
             args.output_video, voice_enabled,
         )
+        print("Stage 11 audio mux complete.", flush=True)
 
     match_text = "analysis-only short mode" if args.short_mode else f"{frame_count} full-match frames"
     print(
@@ -1591,6 +2034,10 @@ def main() -> int:
     parser.add_argument("--o-name", "--opponent-name", dest="o_name", help="name assigned to Stage 3 identity O")
     parser.add_argument("--coach-narrative", type=Path, help="optional Stage 10A Markdown narrative (defaults beside report_json)")
     parser.add_argument(
+        "--review-selection-json", type=Path,
+        help="JSON category choices; defaults to the Stage 10A resolved selection beside report_json, otherwise chooses three or four eligible reviews",
+    )
+    parser.add_argument(
         "--shuttle-tracks", type=Path,
         help="Stage 3A TrackNet JSON; draw the filtered shuttle trail and Stage 10 shot counter",
     )
@@ -1601,6 +2048,10 @@ def main() -> int:
     parser.add_argument(
         "--shot-count-only", action="store_true",
         help="show Stage 10 rally shot counts without drawing a shuttle trail; TrackNet JSON is not required",
+    )
+    parser.add_argument(
+        "--no-shot-count", action="store_true",
+        help="hide the rally shot counter even when TrackNet tracks are supplied",
     )
     parser.add_argument("--pose-model", type=Path, default=Path("models/pose_landmarker_heavy.task"), help="local MediaPipe pose model")
     parser.add_argument("--voice", default="Aman", help="local macOS say voice; default Aman (en_IN)")

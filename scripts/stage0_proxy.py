@@ -78,6 +78,7 @@ def main() -> int:
         action="store_true",
         help="hide FFmpeg warnings and encoding progress while keeping errors visible",
     )
+    parser.add_argument("--machine-progress", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     source = args.input_video.expanduser().resolve()
@@ -165,13 +166,17 @@ def main() -> int:
             "128k",
             "-movflags",
             "+faststart",
-            str(output),
         ])
+        if args.machine_progress:
+            command.extend(["-progress", "pipe:1", "-nostats"])
+        command.append(str(output))
         print(f"Input:  {source}")
         print(f"Output: {output}")
         print(f"Video encoder: {video_encoder}")
         if video_encoder == "h264_videotoolbox":
             print(f"VideoToolbox target bitrate: {args.videotoolbox_bitrate}")
+        if args.machine_progress:
+            print(f"Proxy duration seconds: {max(0.0, source_duration - args.match_start_sec):.3f}", flush=True)
         subprocess.run(command, check=True)
 
         result = probe_video(ffprobe, output)

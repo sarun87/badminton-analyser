@@ -447,6 +447,7 @@ def build_report(
         score_by_n[n] = row
 
     motion_by_n = {row["point_n"]: row for row in motion_rows if isinstance(row.get("point_n"), int)}
+    pose_by_n = {row["point_n"]: row for row in pose_rows if isinstance(row.get("point_n"), int)}
     pickup_by_n = {row["point_n"]: row for row in pickup_rows if isinstance(row.get("point_n"), int)}
 
     video_points: list[dict[str, Any]] = []
@@ -469,6 +470,7 @@ def build_report(
         if duration is None:
             duration = safe_number(motion_row.get("rally_duration_sec"))
         motion_players = motion_row.get("players", {})
+        point_pose = pose_by_n.get(n, {})
         shot_analysis = motion_row.get("shuttle_shot_analysis", {})
         estimated_shots = shot_analysis.get("estimated_shot_count") if isinstance(shot_analysis, dict) else None
         manual_shots = shot_analysis.get("manual_shot_count") if isinstance(shot_analysis, dict) else None
@@ -503,6 +505,8 @@ def build_report(
             "O_distance_m": safe_number(motion_row.get("players", {}).get("O", {}).get("distance_m")),
             "player_distance_m": safe_number(motion_row.get("players", {}).get(player_code, {}).get("distance_m")),
             "opponent_distance_m": safe_number(motion_row.get("players", {}).get(opponent_code, {}).get("distance_m")),
+            "movement_by_player": motion_players,
+            "pose_by_context": point_pose.get("pose_by_context", {}),
             "tracknet_shuttle_evidence": rally.get("tracknet_shuttle_evidence"),
             "tracknet_landing_candidate": pickup_by_n.get(n, {}).get("tracknet_landing_candidate"),
             "estimated_shot_count": estimated_shots,
@@ -633,6 +637,7 @@ def build_report(
     opponent_description = f"Opponent ({player_identity.get(opponent_code, 'other player')})"
     return {
         "title": "Badminton match analysis report",
+        "review_evidence_version": 1,
         "analysis_subject_code": player_code,
         "analysis_subject": {"code": player_code, "name": names[player_code]},
         "players": {
@@ -695,20 +700,20 @@ def select_lost_examples(
     if player_code not in ("R", "O"):
         raise ValueError("analysis player code must be R or O")
     lost = [point for point in points if point["outcome"] == "lost"]
-    short_reliable = sorted(
+    mid_reliable = sorted(
         (
             point for point in lost
             if point["rally_duration_sec"] is not None
-            and point["rally_duration_sec"] <= 5.0
+            and 5.0 < point["rally_duration_sec"] <= 10.0
             and point["rally_end_confidence"] in ("high", "medium")
         ),
         key=lambda point: point["rally_duration_sec"],
     )
-    representative_short = short_reliable[len(short_reliable) // 2] if short_reliable else None
-    short_candidates = [representative_short] if representative_short else []
-    short_candidates.extend(sorted(
-        (p for p in lost if p["rally_duration_sec"] is not None and p["rally_duration_sec"] <= 5.0),
-        key=lambda p: p["rally_duration_sec"],
+    representative_mid = mid_reliable[len(mid_reliable) // 2] if mid_reliable else None
+    mid_candidates = [representative_mid] if representative_mid else []
+    mid_candidates.extend(sorted(
+        (p for p in lost if p["rally_duration_sec"] is not None and 5.0 < p["rally_duration_sec"] <= 10.0),
+        key=lambda p: abs(p["rally_duration_sec"] - 7.5),
     ))
     long_candidates = sorted(
         (p for p in lost if p["rally_duration_sec"] is not None),
@@ -718,22 +723,22 @@ def select_lost_examples(
         (p for p in lost if p.get("player_distance_m") is not None),
         key=lambda p: p["player_distance_m"], reverse=True,
     )
-    short_reason = f"representative short {player_code} loss"
+    mid_reason = f"representative mid-length {player_code} loss"
     long_reason = f"longest {player_code} loss"
     movement_reason = f"highest {player_code} movement among losses"
     candidates = (
-        (short_reason, short_candidates),
+        (mid_reason, mid_candidates),
         (long_reason, long_candidates),
         (movement_reason, movement_candidates),
     )
     reason_labels = {
-        short_reason: f"representative short loss by {names[player_code]}",
+        mid_reason: f"representative mid-length loss by {names[player_code]}",
         long_reason: f"longest loss by {names[player_code]}",
         movement_reason: f"highest tracked movement by {names[player_code]} in a loss",
     }
     seen: set[int] = set()
     result = []
-    short_band = duration_groups["short_0_5s"]
+    mid_band = duration_groups["medium_5_10s"]
     long_losses = duration_groups["long_over_10s"]["by_outcome"]["lost"]
     loss_movement = outcomes["lost"]["players"][player_code]
     for reason, choices in candidates:
@@ -741,13 +746,13 @@ def select_lost_examples(
         if point is None:
             continue
         seen.add(point["point_n"])
-        if reason == short_reason:
-            rate = short_band.get("player_win_rate_pct")
-            rate_text = f"{names[player_code]} won {short_band['player_wins']} of {short_band['rally_count']} rallies in the 0–5 s band ({rate}%). " if rate is not None else "The short-rally sample is limited. "
+        if reason == mid_reason:
+            rate = mid_band.get("player_win_rate_pct")
+            rate_text = f"{names[player_code]} won {mid_band['player_wins']} of {mid_band['rally_count']} rallies in the 5–10 s band ({rate}%). " if rate is not None else "The mid-length-rally sample is limited. "
             duration = point.get("rally_duration_sec")
-            duration_text = f"about {duration:.1f} seconds" if finite(duration) else "a short estimated duration"
+            duration_text = f"about {duration:.1f} seconds" if finite(duration) else "an estimated mid-length duration"
             coach_note = (
-                f"{rate_text}This loss lasted {duration_text}. Review the serve or return and the next shot to identify where the exchange turned."
+                f"{rate_text}This loss lasted {duration_text}. Review the positioning changes and recovery through the exchange; shot type is not identified reliably."
             )
         elif reason == long_reason:
             trips = long_losses["players"][player_code].get("mean_trips_per_rally")
@@ -980,18 +985,18 @@ def markdown_report(data: dict[str, Any]) -> str:
     medium = data["by_rally_length"]["medium_5_10s"]
     long = data["by_rally_length"]["long_over_10s"]
     if short["rally_count"] and medium["rally_count"] and long["rally_count"]:
-        short_example = next(
-            (point for point in data["example_lost_points"] if point["reason"].startswith("representative short")),
+        mid_example = next(
+            (point for point in data["example_lost_points"] if point["reason"].startswith("representative mid-length")),
             None,
         )
-        short_cite = (
-            f" Review short loss at serve {short_example['video_serve_number']} ({format_timestamp(short_example['serve_t'])})."
-            if short_example else " Review the short-loss contact sheets above."
+        mid_cite = (
+            f" Review mid-length loss at serve {mid_example['video_serve_number']} ({format_timestamp(mid_example['serve_t'])})."
+            if mid_example else " Review the mid-length-loss contact sheets above."
         )
         lines.append(
-            f"- **First shots and rally conversion:** {player_name} won {short.get('player_wins', short['R_wins'])}/{short['rally_count']} rallies lasting 5 seconds or less "
+            f"- **Rally-length comparison:** {player_name} won {short.get('player_wins', short['R_wins'])}/{short['rally_count']} rallies lasting 5 seconds or less "
             f"({short.get('player_win_rate_pct', short['R_win_rate_pct'])}%), compared with {medium.get('player_wins', medium['R_wins'])}/{medium['rally_count']} in the 5–10 second band "
-            f"({medium.get('player_win_rate_pct', medium['R_win_rate_pct'])}%). In practice, rehearse serve/return plus the next shot as one sequence.{short_cite}"
+            f"({medium.get('player_win_rate_pct', medium['R_win_rate_pct'])}%). Use this as a broad outcome pattern, not a diagnosis of serve or return quality.{mid_cite}"
         )
     won_ready = ready.get("won", {})
     lost_ready = ready.get("lost", {})
