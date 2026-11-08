@@ -660,6 +660,7 @@ def main() -> int:
                 f"{interval_label} s{first_n:02d}-s{last_n:02d}: {len(pages)} page(s), "
                 f"{frame_total} frames, {float(point['t']):.1f}s to {float(boundary_point['t']):.1f}s."
             )
+            print(f"Rallies processed: {boundary_index}/{len(points)}", flush=True)
             index = boundary_index
             continue
 
@@ -686,6 +687,7 @@ def main() -> int:
             f"{frame_total} frames, {float(point['t']):.1f}s to {end_t:.1f}s."
         )
         index += 1
+        print(f"Rallies processed: {index}/{len(points)}", flush=True)
     cap.release()
 
     end_estimation = None

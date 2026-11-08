@@ -148,6 +148,7 @@
   </section>
 </main>
 <script>
+const basePath = document.body.dataset.basePath || "";
 const $ = (id) => document.getElementById(id);
 let state, candidates = [], timeline = [], selectedId = null, manualCounter = 0, dummyCounter = 0;
 

@@ -754,7 +754,7 @@ def main() -> int:
     total_distance = {"R": 0.0, "O": 0.0}
     total_time = {"R": 0.0, "O": 0.0}
     max_speed: dict[str, float | None] = {"R": None, "O": None}
-    for rally in rallies:
+    for rally_index, rally in enumerate(rallies, start=1):
         start_t = float(rally["serve_t"])
         end_t = float(rally["rally_end_sec"])
         players = {}
@@ -792,6 +792,7 @@ def main() -> int:
                     shuttle_data, rally, net_line
                 )
         point_results.append(point_result)
+        print(f"Rallies processed: {rally_index}/{len(rallies)}", flush=True)
 
     heatmap_dir.mkdir(parents=True, exist_ok=True)
     if args.overwrite:

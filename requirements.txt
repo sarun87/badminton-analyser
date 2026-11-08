@@ -1,4 +1,5 @@
 mediapipe
+matplotlib
 numpy
 onnxruntime
 opencv-contrib-python

@@ -4,7 +4,7 @@
 
 - `scripts/` contains one executable Python module per pipeline stage (`stage0_proxy.py` through `stage11_video.py`), including optional Stage 10A coaching, plus the Stage 4 local review UI.
 - `templates/` contains the local browser UI and example review JSON files; keep UI assets local and dependency-free where practical.
-- `README.md` covers setup and review checkpoints; `command_pipeline.md` contains runnable stage commands.
+- `README.md` introduces the project and links to guides in `docs/`. `docs/how-to-install.md` covers setup, `docs/pipeline_architecture.md` explains the stages and review gates, and `docs/command_pipeline.md` contains runnable commands.
 - `runs/<match-name>/` holds per-match source video, generated JSON, contact sheets, review files, and rendered videos. Run contents are Git-ignored.
 - `models/` holds local model weights and is Git-ignored. The package script includes ONNX and MediaPipe task weights when present.
 
@@ -12,7 +12,7 @@ Keep runtime outputs out of the repository root. Update the README and command e
 
 ## Build, Test, and Development Commands
 
-Create `.venv` with Python 3.11, install `requirements.txt`, and install FFmpeg with `ffprobe` as described in `README.md`. Run an individual stage with `.venv/bin/python scripts/stageN_name.py ...`; direct its generated files to that match's `runs/<match-name>/` directory. After Stage 4, launch `scripts/stage4_review_ui.py` with the proxy, player tracks, serve JSON, and review directory to edit candidate decisions and scoring in a local browser. Full commands are in `command_pipeline.md`. There is no automated test suite currently. Do not add or run tests unless requested.
+Create `.venv` with Python 3.11, install `requirements.txt`, and install FFmpeg with `ffprobe` as described in `docs/how-to-install.md`. Run an individual stage with `.venv/bin/python scripts/stageN_name.py ...`; direct its generated files to that match's `runs/<match-name>/` directory. After Stage 4, launch `scripts/stage4_review_ui.py` with the proxy, player tracks, serve JSON, and review directory to edit candidate decisions and scoring in a local browser. Full commands are in `docs/command_pipeline.md`. There is no automated test suite currently. Do not add or run tests unless requested.
 
 ## Coding Style & Naming Conventions
 

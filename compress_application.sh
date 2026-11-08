@@ -85,7 +85,7 @@ if ! command -v ditto >/dev/null 2>&1; then
   exit 1
 fi
 
-for required in README.md AGENTS.md command_pipeline.md requirements.txt requirements-tracknet.txt .gitignore templates/serve_review.html templates/manual_score_review.json; do
+for required in README.md LICENSE AGENTS.md docs/README.md docs/how-to-install.md docs/pipeline_architecture.md docs/command_pipeline.md docs/tracknet_pilot_plan.md docs/tracknet_event_analysis_plan.md requirements.txt requirements-tracknet.txt .gitignore templates/match_ui.html templates/serve_review.html templates/manual_score_review.json templates/coach_review_selection.json; do
   if [[ ! -f "$PROJECT_ROOT/$required" ]]; then
     printf 'Required project file is missing: %s\n' "$required" >&2
     exit 1
@@ -99,13 +99,15 @@ mkdir -p "$PACKAGE_DIR/scripts" "$PACKAGE_DIR/models" "$PACKAGE_DIR/templates"
 
 cp -p \
   "$PROJECT_ROOT/README.md" \
+  "$PROJECT_ROOT/LICENSE" \
   "$PROJECT_ROOT/AGENTS.md" \
-  "$PROJECT_ROOT/command_pipeline.md" \
   "$PROJECT_ROOT/requirements.txt" \
   "$PROJECT_ROOT/requirements-tracknet.txt" \
   "$PROJECT_ROOT/.gitignore" \
   "$PROJECT_ROOT/compress_application.sh" \
   "$PACKAGE_DIR/"
+
+cp -R "$PROJECT_ROOT/docs" "$PACKAGE_DIR/docs"
 
 for script in "$PROJECT_ROOT"/scripts/*.py; do
   [[ -f "$script" ]] || continue
