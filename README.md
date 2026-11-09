@@ -4,6 +4,8 @@
 
 Badminton Match Analysis is a local video-analysis pipeline for singles matches. It turns a fixed phone recording into a reviewed score timeline, player movement and pose metrics, rally summaries, coaching notes, and an optional analysis video. The pipeline runs on macOS; Apple Silicon can accelerate person detection and H.264 encoding when the installed runtimes and FFmpeg support it.
 
+Sample match analysis video of a game - [Watch on Youtube](https://youtu.be/7ueDPI99MHw)
+
 ![Tool Overview](images/Pipeline.png)
 ![Serve Candidate Analysis](images/Serve_Candidate_Analysis.png)
 ![Shuttle Tracking](images/Shuttle_Tracking_with_TrackNetv3.png)
