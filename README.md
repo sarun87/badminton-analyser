@@ -1,8 +1,8 @@
 ![Static Badge](https://img.shields.io/badge/Built%20with%20AI-blue)
 
-# Badminton Match Analysis
+# Volatilis - A Badminton Match Analysis tool
 
-Badminton Match Analysis is a local video-analysis pipeline for singles matches. It turns a fixed phone recording into a reviewed score timeline, player movement and pose metrics, rally summaries, coaching notes, and an optional analysis video. The pipeline runs on macOS; Apple Silicon can accelerate person detection and H.264 encoding when the installed runtimes and FFmpeg support it.
+Volatilis is a local video-analysis pipeline for singles matches. It turns a fixed phone recording into a reviewed score timeline, player movement and pose metrics, rally summaries, coaching notes, and an optional analysis video. The pipeline runs on macOS; Apple Silicon can accelerate person detection and H.264 encoding when the installed runtimes and FFmpeg support it.
 
 Sample match analysis video of a game - [Watch on Youtube](https://youtu.be/7ueDPI99MHw)
 
